@@ -126,8 +126,9 @@ PAPER_TRADES = _validator(
         "market_id": STR,
         "strike": NONNEG,
         "side": {"enum": ["yes", "no"]},
-        "price": {"bsonType": "number", "exclusiveMinimum": 0, "exclusiveMaximum": 1},
-        "stake": {"bsonType": "number", "exclusiveMinimum": 0},
+        # MongoDB's $jsonSchema is draft 4: exclusive* are boolean flags on minimum/maximum.
+        "price": {"bsonType": "number", "minimum": 0, "exclusiveMinimum": True, "maximum": 1, "exclusiveMaximum": True},
+        "stake": {"bsonType": "number", "minimum": 0, "exclusiveMinimum": True},
         "fees": NONNEG,
         "model_p": PROB,
         "edge": NUM,
