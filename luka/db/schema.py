@@ -41,6 +41,7 @@ GAMES = _validator(
     ["game_id", "player_id", "season", "game_date", "opponent", "home", "minutes", "pts", "reb", "ast"],
     {
         "game_id": STR,  # nba_api GAME_ID, e.g. "0022600045"
+        "game_key": STR,  # venue-neutral join key to market data, e.g. "2026-10-28_LAL_LAC"
         "player_id": INT,
         "season": STR,  # "2026-27"
         "season_type": {"enum": ["regular", "playoffs", "play_in", "cup_final"]},
@@ -183,10 +184,10 @@ COLLECTIONS: dict[str, dict] = {
         "indexes": [([("meta.player_id", ASC), ("reported_at", DESC)], {})],
     },
     "market_snapshots": {
-        # meta: {venue, game_id, market_id, stat, strike}
+        # meta: {venue, game_key, market_id, stat, strike}; strike k means "at least k"
         "timeseries": {"timeField": "snapshot_at", "metaField": "meta", "granularity": "minutes"},
         "indexes": [
-            ([("meta.game_id", ASC), ("meta.stat", ASC), ("snapshot_at", DESC)], {}),
+            ([("meta.game_key", ASC), ("meta.stat", ASC), ("snapshot_at", DESC)], {}),
             ([("meta.market_id", ASC), ("snapshot_at", DESC)], {}),
         ],
     },

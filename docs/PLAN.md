@@ -20,7 +20,7 @@ Companion to [PRD.md](PRD.md). One milestone at a time: build, test, commit.
 - [x] `requirements.txt`, `.env.example`, package skeleton
 - [x] `db/schema.py`: collections, validators and indexes, safe to re-run (apply to Atlas once the cluster exists)
 - [ ] `ingest/games.py`: career game logs from `nba_api`, upserted by `game_id`. Test whether it works from GitHub Actions or has to run locally
-- [ ] `ingest/markets.py`: Kalshi ladder and Polymarket O/U snapshots into `market_snapshots`; normalize live vs. archive field names
+- [x] `ingest/markets.py`: Kalshi ladder and Polymarket O/U snapshots into `market_snapshots` (archive normalization comes with the week 5 backtest)
 - [ ] Schedule market snapshots (GitHub Actions cron)
 - [ ] Notebook or script: season-average baseline MAE
 
