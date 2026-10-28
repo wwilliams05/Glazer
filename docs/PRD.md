@@ -46,7 +46,7 @@ A personal AI agent that predicts Luka Dončić's points, rebounds and assists f
 | `games` | Regular; unique `game_id` | One doc per Luka game: opponent, home/away, minutes, PTS/REB/AST, usage, rest days, back-to-back flag, embedded `teammates_out` |
 | `players` | Regular | Teammates and opponents with key season stats |
 | `injury_reports` | Time series | Status snapshots over time, so the model only sees what was known before tip-off |
-| `market_snapshots` | Time series; meta `{venue, market_id, stat, strike}` | Kalshi and Polymarket bid, ask and volume every 15 min before tip-off |
+| `market_snapshots` | Time series; meta `{venue, game_id, market_id, stat, strike}` | Kalshi and Polymarket bid, ask and volume every 15 min before tip-off |
 | `news` | Atlas Vector Search (Voyage AI) | Injury reports and game recaps for retrieval |
 | `features` | Regular; unique `game_id` | Exact feature values the model saw, plus an `as_of` timestamp |
 | `predictions` | Regular; unique `game_id + stat + model_version` | Point prediction, range, P(≥ k) per strike, top drivers, market at prediction time, actual, error |

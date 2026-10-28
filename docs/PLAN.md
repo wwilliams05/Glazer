@@ -17,8 +17,8 @@ Companion to [PRD.md](PRD.md). One milestone at a time: build, test, commit.
 
 - [ ] Create an Atlas M0 cluster (free; no credits needed). Put `MONGODB_URI` in `.env`
 - [ ] Connect the MongoDB MCP server to Claude Code (read-only mode first)
-- [ ] `requirements.txt`, `.env.example`, package skeleton
-- [ ] `db/schema.py`: collections, validators and indexes, safe to re-run
+- [x] `requirements.txt`, `.env.example`, package skeleton
+- [x] `db/schema.py`: collections, validators and indexes, safe to re-run (apply to Atlas once the cluster exists)
 - [ ] `ingest/games.py`: career game logs from `nba_api`, upserted by `game_id`. Test whether it works from GitHub Actions or has to run locally
 - [ ] `ingest/markets.py`: Kalshi ladder and Polymarket O/U snapshots into `market_snapshots`; normalize live vs. archive field names
 - [ ] Schedule market snapshots (GitHub Actions cron)

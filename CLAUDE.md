@@ -13,6 +13,12 @@ Predicts Luka Dončić's PTS, REB and AST, explains why, and paper-trades the pr
 - **LLMs only where judgment is needed.** Ingestion, features, prediction, bet decisions and scoring are deterministic Python.
 - **Chat answers:** every number comes from a tool result; always show the range; never call a pick a lock.
 
+## Commands
+
+- Setup: `py -3.11 -m venv .venv`, then `.venv/Scripts/python -m pip install -r requirements.txt`
+- Tests: `.venv/Scripts/python -m pytest -q` (Atlas tests skip unless `MONGODB_URI` is set; they use the `luka_test` database)
+- Apply schema: `.venv/Scripts/python -m luka.db.schema` (`--dry-run` to preview)
+
 ## Conventions
 
 - Python 3.11, package code under `luka/`.
