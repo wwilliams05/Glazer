@@ -15,14 +15,14 @@ Companion to [PRD.md](PRD.md). One milestone at a time: build, test, commit.
 
 ## Week 1 checklist
 
-- [ ] Create an Atlas M0 cluster (free; no credits needed). Put `MONGODB_URI` in `.env`
+- [x] Create an Atlas M0 cluster (free; no credits needed). Put `MONGODB_URI` in `.env` (cluster `Glazer`, AWS us-east-1, schema applied 2026-11-16)
 - [ ] Connect the MongoDB MCP server to Claude Code (read-only mode first)
 - [x] `requirements.txt`, `.env.example`, package skeleton
 - [x] `db/schema.py`: collections, validators and indexes, safe to re-run (apply to Atlas once the cluster exists)
-- [ ] `ingest/games.py`: career game logs from `nba_api`, upserted by `game_id`. Test whether it works from GitHub Actions or has to run locally
+- [x] `ingest/games.py`: career game logs from `nba_api`, upserted by `game_id` (581 games loaded 2026-11-16). Daily `--current` run in `.github/workflows/game-logs.yml`; whether stats.nba.com allows GitHub's IPs is still to be confirmed
 - [x] `ingest/markets.py`: Kalshi ladder and Polymarket O/U snapshots into `market_snapshots` (archive normalization comes with the week 5 backtest)
 - [x] Schedule market snapshots: `.github/workflows/market-snapshots.yml`, every 15 min, needs repo secret `MONGODB_URI` and Atlas Network Access `0.0.0.0/0`. Runs only from `main`
-- [ ] Notebook or script: season-average baseline MAE
+- [x] Script: season-average baseline MAE (`python -m luka.model.baseline`). As of 2026-11-16: PTS 6.63, REB 2.52, AST 2.65 over 580 games; 2025-26 on: PTS 7.37, REB 2.60, AST 2.53 (76 games)
 
 ## Repo layout
 
