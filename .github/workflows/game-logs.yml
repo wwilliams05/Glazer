@@ -1,0 +1,31 @@
+name: Game logs
+
+on:
+  schedule:
+    # 11:00 UTC = 3-4 AM Pacific; every West Coast game has finished and stats.nba.com has updated.
+    - cron: "0 11 * * *"
+  workflow_dispatch:  # "Run workflow" button for manual runs
+
+concurrency:
+  group: game-logs
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    # stats.nba.com often stalls on cloud IPs; the script retries, but cap the whole job.
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: python -m luka.ingest.games --current
+        env:
+          MONGODB_URI: ${{ secrets.MONGODB_URI }}
+          MONGODB_DB: luka
