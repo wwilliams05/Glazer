@@ -58,7 +58,7 @@ copy .env.example .env          # then set MONGODB_URI
 | Job | Where | Why there |
 |---|---|---|
 | Market snapshots, every 15 min | [GitHub Actions](.github/workflows/market-snapshots.yml), plus a Windows scheduled task as backup | GitHub delays and skips frequent schedules, so the laptop fills the gaps |
-| Game logs, daily | Windows scheduled task ([scripts/update_games.cmd](scripts/update_games.cmd)) | `stats.nba.com` blocks GitHub's servers |
+| Game logs, daily | Windows scheduled task ([scripts/run_logged.py](scripts/run_logged.py) running `luka.ingest.games --current`) | `stats.nba.com` blocks GitHub's servers |
 
 The GitHub job needs a repository secret `MONGODB_URI`, and Atlas Network Access must allow `0.0.0.0/0`.
 
