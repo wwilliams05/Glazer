@@ -9,6 +9,10 @@ Meant to run every 15 minutes. Each run:
 Strikes are normalized to "at least k" on both venues: Kalshi "30+" (floor_strike 29.5)
 and Polymarket "O/U 29.5" both become k=30, so the model only has to price P(stat >= k).
 
+The same task then runs the live prediction step (luka.model.predict), which only does
+work in the ~2 hours before a tip-off. On days when the schedule shows no Lakers game within
+QUIET_HORIZON, the run exits after one database query.
+
     python -m luka.ingest.markets [--dry-run]
 """
 import argparse
@@ -18,7 +22,7 @@ import re
 import sys
 import unicodedata
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -33,6 +37,9 @@ KALSHI_SERIES = {"pts": "KXNBAPTS", "reb": "KXNBAREB", "ast": "KXNBAAST"}
 KALSHI_GAME_SERIES = "KXNBAGAME"
 PM_STATS = {"points": "pts", "rebounds": "reb", "assists": "ast"}
 MONTHS = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
+
+QUIET_HORIZON = timedelta(hours=30)  # Kalshi lists Luka's props about a day before tip-off
+SCHEDULE_MAX_AGE = timedelta(days=3)  # older than this and we don't trust it to skip a run
 
 # Raw cache keeps only these fields; full payloads would fill the M0 tier's 512 MB quickly.
 KALSHI_RAW_FIELDS = [
@@ -182,11 +189,12 @@ def upcoming_games(session: requests.Session) -> list[Game]:
 
 
 def snapshot_game(
-    session: requests.Session, game: Game, now: datetime
+    session: requests.Session, game: Game, now: datetime, schedule_tip_off: datetime | None = None
 ) -> tuple[datetime | None, list[dict], list[dict], list[str]]:
     """Returns (tip_off, snapshots, raw cache docs, errors) for one game.
 
-    A venue failing doesn't stop the other.
+    A venue failing doesn't stop the other. Tip-off comes from Polymarket, or from our
+    schedule collection when Polymarket fails or doesn't list the game.
     """
     snapshots, raw, errors = [], [], []
 
@@ -198,6 +206,7 @@ def snapshot_game(
             pm_markets = [m for m in events[0].get("markets", []) if is_luka_pm_market(m)]
     except requests.RequestException as e:
         errors.append(f"polymarket: {e}")
+    tip_off = tip_off or schedule_tip_off
 
     if tip_off and now >= tip_off:
         return tip_off, [], [], errors  # in-game prices are useless for pre-game decisions
@@ -227,12 +236,36 @@ def snapshot_game(
     return tip_off, snapshots, raw, errors
 
 
+def quiet_until(db, now: datetime) -> datetime | None:
+    """If a fresh schedule shows no game of ours within QUIET_HORIZON, the next tip-off (or
+    `now + QUIET_HORIZON` when none is scheduled). Otherwise None, meaning run as usual.
+
+    A stale or empty schedule never causes a skip: missing a game is worse than a wasted run.
+    """
+    newest = db.schedule.find_one({"team": TEAM}, {"updated_at": 1}, sort=[("updated_at", -1)])
+    if newest is None or newest["updated_at"] < now - SCHEDULE_MAX_AGE:
+        return None
+    nxt = db.schedule.find_one({"team": TEAM, "status": {"$in": ["scheduled", "live"]},
+                                "tip_off": {"$gt": now - timedelta(hours=4)}}, sort=[("tip_off", 1)])
+    if nxt is None:
+        return now + QUIET_HORIZON
+    return nxt["tip_off"] if nxt["tip_off"] > now + QUIET_HORIZON else None
+
+
+def schedule_tip_offs(db) -> dict[str, datetime]:
+    if db is None:
+        return {}
+    return {d["game_key"]: d["tip_off"] for d in db.schedule.find(
+        {"team": TEAM, "tip_time_tbd": {"$ne": True}}, {"game_key": 1, "tip_off": 1})}
+
+
 def run(db, session: requests.Session, now: datetime | None = None, dry_run: bool = False) -> bool:
     """Snapshot every upcoming Lakers game. Returns False if any request failed."""
     now = now or datetime.now(timezone.utc)
     ok = True
+    tips = schedule_tip_offs(db)
     for game in upcoming_games(session):
-        tip_off, snapshots, raw, errors = snapshot_game(session, game, now)
+        tip_off, snapshots, raw, errors = snapshot_game(session, game, now, tips.get(game.key))
         venues = {v: sum(s["meta"]["venue"] == v for s in snapshots) for v in ("kalshi", "polymarket")}
         tip = f"tip {tip_off:%Y-%m-%d %H:%MZ}" if tip_off else "tip unknown"
         if tip_off and now >= tip_off:
@@ -258,7 +291,22 @@ def main() -> None:
     from luka.db.client import get_db
 
     db = None if args.dry_run else get_db()
-    sys.exit(0 if run(db, make_session(), dry_run=args.dry_run) else 1)
+    now = datetime.now(timezone.utc)
+    if db is not None and (until := quiet_until(db, now)):
+        print(f"no {TEAM} game before {until:%Y-%m-%d %H:%MZ}; nothing to snapshot")
+        sys.exit(0)
+    ok = run(db, make_session(), now=now, dry_run=args.dry_run)
+    if db is not None:
+        # Predict after snapshotting, so the prediction can use the prices just taken. Imported
+        # here: pandas and scikit-learn are slow to load and most runs never get this far.
+        from luka.model import predict
+
+        try:
+            ok &= predict.run(db)
+        except Exception as e:  # the snapshots are already written; log the failure and exit 1
+            print(f"ERROR prediction step: {type(e).__name__}: {e}")
+            ok = False
+    sys.exit(0 if ok else 1)
 
 
 if __name__ == "__main__":

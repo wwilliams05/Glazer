@@ -43,6 +43,14 @@ Range coverage meets the 70–90% target for all three. Beating the baseline is 
 
 **Holdout caveat:** the first version (`m1`: raw-stat target, models chosen on 2024-25 alone) lost to the baseline on the test games (PTS 7.95, REB 2.98, AST 2.41). `m2` was designed after seeing that, so the 2025-26+ games are no longer a clean holdout. The clean check is live games from 2026-11-23 on, scored by the week 4 scoring job.
 
+## Live predictions (added 2026-11-23, so the clean holdout gets scored)
+
+- [x] `ingest/schedule.py`: Lakers schedule from stats.nba.com `scheduleleaguev2` into `schedule` (game_id, tip-off, status), refreshed daily by `games --current` (AGENTS.md risk 3)
+- [x] `model/predict.py`: inside the 15-minute snapshot task, ~2 h before each tip-off: one features doc (`availability_source: last_box_score`, i.e. whoever played the last game) and one `m2` prediction per stat, insert-only (risk 2). P(stat ≥ k) for every whole k, not just the listed ladder; `market` records the ladder and snapshot used
+- [x] `model/cards/m2.json`: the walk-forward's model choice and residuals, frozen. Live `m2` refits that choice on every finished game before the one it predicts (the test-table numbers above were trained on seasons before 2025-26 only)
+- [x] `ingest/markets.py` exits early when the schedule shows no game within 30 h; falls back to the schedule's tip-off when Polymarket has none
+- [ ] Laptop asleep at prediction time = no prediction (risk 6). GitHub Actions runs the same step once this is on `main`; the unique index stops the two from writing twice
+
 ## Repo layout
 
 ```

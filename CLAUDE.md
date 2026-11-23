@@ -19,12 +19,14 @@ Predicts Luka Dončić's PTS, REB and AST, explains why, and paper-trades the pr
 - Tests: `.venv/Scripts/python -m pytest -q` (Atlas tests skip unless `MONGODB_URI` is set; they use the `luka_test` database)
 - Apply schema: `.venv/Scripts/python -m luka.db.schema` (`--dry-run` to preview)
 - Rebuild features: `.venv/Scripts/python -m luka.features.pipeline`; train and evaluate: `.venv/Scripts/python -m luka.model.train`
+- Reload the schedule now: `.venv/Scripts/python -m luka.ingest.schedule`
 - Prefix Python runs with `PYTHONIOENCODING=utf-8`, or printing "Dončić" crashes the Windows console.
 
 ## Operations
 
-- **Market snapshots** run every 15 min two ways: GitHub Actions (`.github/workflows/market-snapshots.yml`, unreliable timing) and the Windows task "Glazer market snapshots" (`pythonw scripts/run_logged.py markets_snapshots.log luka.ingest.markets`).
-- **Game logs and team data** run daily via the Windows task "Glazer game logs" (`pythonw scripts/run_logged.py games_update.log luka.ingest.games --current`). stats.nba.com blocks GitHub's servers, so this can't move to Actions.
+- **Market snapshots** run every 15 min two ways: GitHub Actions (`.github/workflows/market-snapshots.yml`, unreliable timing) and the Windows task "Glazer market snapshots" (`pythonw scripts/run_logged.py markets_snapshots.log luka.ingest.markets`). The same run then calls `luka.model.predict`, which writes live predictions ~2 h before tip-off; on days with no game within 30 h it exits after one query.
+- **Game logs, team data and schedule** run daily via the Windows task "Glazer game logs" (`pythonw scripts/run_logged.py games_update.log luka.ingest.games --current`). stats.nba.com blocks GitHub's servers, so this can't move to Actions.
+- **Predictions are write-once.** Never update or delete a `predictions` doc before its game. Check a prediction without writing: `python -m luka.model.predict --dry-run --game-id <id>`. `luka/model/cards/m2.json` is frozen; a model change is a new `MODEL_VERSION`.
 - Logs (`*.log`) are in the repo root and git-ignored. `scripts/run_logged.py` waits for the network before running.
 - Claude Code's permission check blocks creating or changing Windows scheduled tasks. Give the owner a PowerShell command to paste instead.
 - **Git:** one branch per milestone (e.g. `week2-features`), commit per step with tests passing, then fast-forward `main` and push.

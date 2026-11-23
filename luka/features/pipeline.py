@@ -16,6 +16,13 @@ as_of is midnight UTC on the game's (US Eastern) date. Groups 1 and 2 use only g
 earlier dates. Group 3 uses who actually played, a stand-in for the pre-game injury report;
 availability_source records that, so live rows (from the injury report) can be told apart.
 
+Upcoming games (live predictions, luka.model.predict): build(db, upcoming=...) adds a
+placeholder row for a game that hasn't been played. It goes through the same window code as
+every historical row ($unionWith a $documents stage), so live and training features are
+computed identically. The placeholder has no stats, and every window ends before it. For
+group 3 it assumes the players from the team's latest box score are available
+(availability_source "last_box_score") until injury reports are ingested.
+
     python -m luka.features.pipeline              # rebuild every game's features
     python -m luka.features.pipeline --dry-run    # compute and print a summary only
 """
@@ -46,14 +53,27 @@ FEATURE_COLUMNS = (
 
 # ---- 1. Luka's form -------------------------------------------------------------------
 
-def form_pipeline(player_id: int = PLAYER_ID) -> list[dict]:
+def _placeholders(docs: list[dict]) -> list[dict]:
+    """Append rows that aren't in the collection (upcoming games) to an aggregation's input.
+
+    $documents makes rows out of literal values; $unionWith adds them after the real ones.
+    """
+    return [{"$unionWith": {"pipeline": [{"$documents": docs}]}}] if docs else []
+
+
+def form_pipeline(player_id: int = PLAYER_ID, upcoming: dict | None = None) -> list[dict]:
     rolling = {
         f"{s}_avg{n}": {"$avg": f"${s}", "window": {"documents": [-n, -1]}}
         for s in FORM_STATS for n in (5, 10)
     }
     season = {f"{s}_season_to_date": {"$avg": f"${s}", "window": {"documents": ["unbounded", -1]}} for s in FORM_STATS}
+    # The upcoming game as a games-shaped row with no stats. The windows end at -1, so it
+    # never reads its own (absent) stats; it only reads the games before it.
+    extra = [{"player_id": player_id, **{k: upcoming[k] for k in ("game_id", "game_date", "season", "team",
+                                                                  "opponent", "home")}}] if upcoming else []
     return [
         {"$match": {"player_id": player_id}},
+        *_placeholders(extra),
         {"$setWindowFields": {
             "partitionBy": "$player_id",
             "sortBy": {"game_date": 1},
@@ -90,10 +110,16 @@ def add_form_fallbacks(form: pd.DataFrame, games: pd.DataFrame) -> pd.DataFrame:
 
 # ---- 2. Opponent strength -------------------------------------------------------------
 
-def opponent_pipeline(game_ids: list[str]) -> list[dict]:
+def opponent_pipeline(game_ids: list[str], upcoming: dict | None = None) -> list[dict]:
     prev = {"documents": [-OPP_WINDOW, -1]}
     year = {"range": [-365, -1], "unit": "day"}  # earlier calendar days only, never the same day
+    # The upcoming game as two team_games-shaped rows (one per team) with no box score.
+    extra = [
+        {"game_id": upcoming["game_id"], "team": t, "game_date": upcoming["game_date"]}
+        for t in (upcoming["team"], upcoming["opponent"])
+    ] if upcoming else []
     return [
+        *_placeholders(extra),
         {"$setWindowFields": {
             "partitionBy": "$team",
             "sortBy": {"game_date": 1},
@@ -138,13 +164,19 @@ def opponent_features(rows: pd.DataFrame) -> pd.DataFrame:
 
 # ---- 3. Teammates out -----------------------------------------------------------------
 
-def teammate_features(luka_games: pd.DataFrame, team_players: pd.DataFrame, player_id: int = PLAYER_ID) -> pd.DataFrame:
+def teammate_features(
+    luka_games: pd.DataFrame, team_players: pd.DataFrame, player_id: int = PLAYER_ID,
+    assume_played: dict[str, set] | None = None,
+) -> pd.DataFrame:
     """For each Luka game: rotation teammates from the team's previous games who didn't play.
 
     Rotation = played at least ROTATION_MIN_GAMES of the team's last TEAM_WINDOW games, averaging
     ROTATION_MIN_MINUTES+ when they played. Shot volume ("load") = FGA + 0.44*FTA + TOV.
     usage_share_out is the out players' average load over the team's average load per game.
+
+    assume_played: game_id -> player ids expected to play, for games without a box score yet.
     """
+    assume_played = assume_played or {}
     tp = team_players.copy()
     tp["load"] = tp["fga"] + 0.44 * tp["fta"] + tp["tov"]
     out_rows = []
@@ -161,7 +193,10 @@ def teammate_features(luka_games: pd.DataFrame, team_players: pd.DataFrame, play
             mates = window[window["player_id"] != player_id].groupby("player_id").agg(
                 games=("game_id", "nunique"), minutes=("minutes", "mean"), load=("load", "mean"))
             rotation = mates[(mates["games"] >= ROTATION_MIN_GAMES) & (mates["minutes"] >= ROTATION_MIN_MINUTES)]
-            played = set(by_game[g["game_id"]]["player_id"]) if g["game_id"] in by_game else set()
+            if g["game_id"] in assume_played:
+                played = assume_played[g["game_id"]]
+            else:
+                played = set(by_game[g["game_id"]]["player_id"]) if g["game_id"] in by_game else set()
             out = rotation[~rotation.index.isin(played)]
             top = rotation["load"].idxmax() if len(rotation) else None
             out_rows.append({
@@ -175,21 +210,48 @@ def teammate_features(luka_games: pd.DataFrame, team_players: pd.DataFrame, play
 
 # ---- Assemble -------------------------------------------------------------------------
 
-def build(db, player_id: int = PLAYER_ID) -> pd.DataFrame:
-    """One row per Luka game: game_id, game_date and FEATURE_COLUMNS (NaN where unknown)."""
-    games = pd.DataFrame(list(db.games.find({"player_id": player_id}, {"_id": 0})))
-    form = add_form_fallbacks(pd.DataFrame(list(db.games.aggregate(form_pipeline(player_id)))), games)
+def latest_box_score_players(team_players: pd.DataFrame, team: str, before) -> tuple[set, object]:
+    """Who played in `team`'s most recent game before `before`, and that game's date."""
+    rows = team_players[(team_players["team"] == team) & (team_players["game_date"] < before)]
+    if rows.empty:
+        return set(), None
+    last = rows["game_date"].max()
+    return set(rows.loc[rows["game_date"] == last, "player_id"]), last
 
-    opp_rows = pd.DataFrame(list(db.team_games.aggregate(opponent_pipeline(games["game_id"].tolist()))))
+
+def build(db, player_id: int = PLAYER_ID, upcoming: dict | None = None) -> pd.DataFrame:
+    """One row per Luka game: game_id, game_date and FEATURE_COLUMNS (NaN where unknown).
+
+    upcoming: a schedule doc for a game not yet played (game_id, game_date, season, team,
+    opponent, home). Adds its row, built from games before its date only.
+    """
+    games = pd.DataFrame(list(db.games.find({"player_id": player_id}, {"_id": 0})))
+    if upcoming is not None and (
+        upcoming["game_id"] in set(games["game_id"])
+        or db.team_games.find_one({"game_id": upcoming["game_id"]}, {"_id": 1})
+        or db.team_player_games.find_one({"game_id": upcoming["game_id"]}, {"_id": 1})
+    ):
+        # Checked in all three: if Luka sat out, only the team tables would have the game, and
+        # its real row would tie with the placeholder in the opponent window.
+        raise ValueError(f"{upcoming['game_id']} already has a box score; it isn't upcoming")
+    form = add_form_fallbacks(pd.DataFrame(list(db.games.aggregate(form_pipeline(player_id, upcoming)))), games)
+
+    game_ids = games["game_id"].tolist() + ([upcoming["game_id"]] if upcoming else [])
+    opp_rows = pd.DataFrame(list(db.team_games.aggregate(opponent_pipeline(game_ids, upcoming))))
     opp = opponent_features(opp_rows)
     # Each Luka game has two team rows; keep the opponent's.
     opp = opp.merge(form[["game_id", "opponent"]], left_on=["game_id", "team"], right_on=["game_id", "opponent"])
 
+    teams = set(games["team"]) | ({upcoming["team"]} if upcoming else set())
     team_players = pd.DataFrame(list(db.team_player_games.find(
-        {"team": {"$in": games["team"].unique().tolist()}},
+        {"team": {"$in": sorted(teams)}},
         {"_id": 0, "game_id": 1, "player_id": 1, "team": 1, "game_date": 1, "minutes": 1, "fga": 1, "fta": 1, "tov": 1},
     )))
-    mates = teammate_features(form[["game_id", "game_date", "team"]], team_players, player_id)
+    assume = {}
+    if upcoming:
+        # No injury data yet: assume whoever played the team's last game plays this one.
+        assume[upcoming["game_id"]], _ = latest_box_score_players(team_players, upcoming["team"], upcoming["game_date"])
+    mates = teammate_features(form[["game_id", "game_date", "team"]], team_players, player_id, assume)
 
     df = (form.merge(opp[["game_id", "opp_def_rtg_rel", "opp_pace_rel"]], on="game_id", how="left")
               .merge(mates, on="game_id", how="left"))

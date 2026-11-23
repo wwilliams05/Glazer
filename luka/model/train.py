@@ -21,9 +21,19 @@ The predictive distribution comes from the walk-forward residuals (actual - pred
 The 80% range is prediction + their 10th and 90th percentiles, and
 P(stat >= k) = share of residuals > (k - 0.5 - prediction).
 
+Model card: --save-card writes the walk-forward's choice per stat and its residuals to
+luka/model/cards/m2.json. Live predictions (luka.model.predict) read it instead of rerunning
+the selection, which takes about 45 s per stat. The choice uses only seasons before TEST_FROM,
+so rerunning it gives the same card; treat the file as immutable, like a strategy config.
+
     python -m luka.model.train
+    python -m luka.model.train --save-card
 """
+import argparse
 import itertools
+import json
+from datetime import datetime, timezone
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -40,6 +50,7 @@ TEST_FROM = "2025-26"
 WALK_FORWARD_FROM = "2021-22"  # first season predicted in the walk-forward (needs 3 seasons to train on)
 RANGE_LEVEL = 0.8
 SEED = 0
+CARD_PATH = Path(__file__).parent / "cards" / f"{MODEL_VERSION}.json"
 
 CANDIDATES = (
     [("baseline", {})]
@@ -50,8 +61,10 @@ CANDIDATES = (
 
 
 def load_dataset(db) -> pd.DataFrame:
+    # Historical rows only. Live rows (availability_source "last_box_score") share the game_id
+    # once the game is played and were built from different availability data.
     feats = pd.DataFrame([{"game_id": d["game_id"], **d["values"]} for d in db.features.find(
-        {"pipeline_version": PIPELINE_VERSION}, {"_id": 0, "game_id": 1, "values": 1})])
+        {"pipeline_version": PIPELINE_VERSION, "availability_source": "box_score"}, {"_id": 0, "game_id": 1, "values": 1})])
     games = pd.DataFrame(list(db.games.find({}, {"_id": 0, "game_id": 1, "game_date": 1, "season": 1, **{s: 1 for s in STATS}})))
     df = games.merge(feats, on="game_id").sort_values(["game_date", "game_id"]).reset_index(drop=True)
     # Rows with no history (career start, first games of the opponent windows) can't be scored fairly.
@@ -64,13 +77,19 @@ def make_model(kind: str, params: dict):
     return HistGradientBoostingRegressor(random_state=SEED, **params)
 
 
+def fit_adjustment(kind: str, params: dict, train: pd.DataFrame, stat: str):
+    """The fitted model of (stat - season average to date), or None for the baseline."""
+    if kind == "baseline":
+        return None
+    return make_model(kind, params).fit(train[FEATURE_COLUMNS], train[stat] - train[f"{stat}_season"])
+
+
 def fit_predict(kind: str, params: dict, train: pd.DataFrame, test: pd.DataFrame, stat: str) -> np.ndarray:
     """Baseline (season average to date) plus a learned adjustment, floored at 0."""
     base = test[f"{stat}_season"].to_numpy()
-    if kind == "baseline":
+    model = fit_adjustment(kind, params, train, stat)
+    if model is None:
         return base
-    adjustment = train[stat] - train[f"{stat}_season"]
-    model = make_model(kind, params).fit(train[FEATURE_COLUMNS], adjustment)
     return np.clip(base + model.predict(test[FEATURE_COLUMNS]), 0, None)
 
 
@@ -131,10 +150,48 @@ def evaluate(df: pd.DataFrame, stat: str) -> dict:
     }
 
 
+def model_card(df: pd.DataFrame) -> dict:
+    """The walk-forward choice per stat, with the residuals that give its range and P(stat >= k)."""
+    pre_test = df[df["season"] < TEST_FROM]  # choose_model never looks further, but make it explicit
+    stats = {}
+    for stat in STATS:
+        kind, params, wf_mae, residuals = choose_model(pre_test, stat)
+        stats[stat] = {"kind": kind, "params": params, "wf_mae": round(wf_mae, 4),
+                       "residuals": [round(float(r), 4) for r in residuals]}
+    return {
+        "model_version": MODEL_VERSION, "pipeline_version": PIPELINE_VERSION, "range_level": RANGE_LEVEL,
+        "chosen_on": f"walk-forward {WALK_FORWARD_FROM} to the season before {TEST_FROM}",
+        "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "stats": stats,
+    }
+
+
+def load_card(path: Path = CARD_PATH) -> dict:
+    card = json.loads(path.read_text(encoding="utf-8"))
+    if card["model_version"] != MODEL_VERSION or card["pipeline_version"] != PIPELINE_VERSION:
+        raise RuntimeError(f"{path.name} is for {card['model_version']}/{card['pipeline_version']}, "
+                           f"code is {MODEL_VERSION}/{PIPELINE_VERSION}")
+    return card
+
+
 def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--save-card", action="store_true", help=f"write {CARD_PATH.name} for live predictions")
+    args = parser.parse_args()
+
     from luka.db.client import get_db
 
     df = load_dataset(get_db())
+    if args.save_card:
+        if CARD_PATH.exists():
+            raise SystemExit(f"{CARD_PATH} exists; a changed model is a new MODEL_VERSION, not a new card")
+        CARD_PATH.parent.mkdir(exist_ok=True)
+        card = model_card(df)
+        CARD_PATH.write_text(json.dumps(card, indent=1) + "\n", encoding="utf-8")
+        for s, c in card["stats"].items():
+            print(f"{s}: {c['kind']} {c['params']}  walk-forward MAE {c['wf_mae']}  ({len(c['residuals'])} residuals)")
+        print(f"wrote {CARD_PATH}")
+        return
     print(f"{len(df)} games with full features; test = {TEST_FROM} onward\n")
     rows = [evaluate(df, s) for s in STATS]
     print(f"{'':<14}{'walk-forward MAE':^20}{'test MAE':^20}")

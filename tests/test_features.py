@@ -159,6 +159,42 @@ def test_opponent_window_and_teammate_out_end_to_end(db):
     assert last["n_rotation_out"] == 1
 
 
+def _upcoming(i: int) -> dict:
+    """Game i of _season as a schedule doc: what predict passes to build() before tip-off."""
+    return {"game_id": f"00225{i:05d}", "game_date": day(2 * i), "season": "2025-26", "team": "AAA",
+            "opponent": "BBB", "home": i % 2 == 0}
+
+
+@atlas
+def test_upcoming_placeholder_gets_the_same_features_as_the_played_game(db):
+    # The live row must equal the row the same game gets once it's been played, apart from
+    # teammates (who played vs who played last game). Otherwise live and training differ.
+    _load(db, _season(13))
+    played = build(db).set_index("game_id").loc["0022500012"]
+    _load(db, _season(12))
+    live = build(db, upcoming=_upcoming(12)).set_index("game_id").loc["0022500012"]
+    same = [c for c in FEATURE_COLUMNS if c not in ("n_rotation_out", "usage_share_out", "top_teammate_out")]
+    pd.testing.assert_series_equal(live[same], played[same])
+    # Player 1 sat game 11, the last box score, so the live row assumes he's out again;
+    # in the real game 12 he played.
+    assert live["n_rotation_out"] == 1 and played["n_rotation_out"] == 0
+
+
+@atlas
+def test_upcoming_placeholder_leaves_historical_rows_unchanged(db):
+    _load(db, _season(12))
+    without = build(db).set_index("game_id")
+    with_ = build(db, upcoming=_upcoming(12)).set_index("game_id").loc[without.index]
+    pd.testing.assert_frame_equal(without[FEATURE_COLUMNS], with_[FEATURE_COLUMNS])
+
+
+@atlas
+def test_played_game_is_not_upcoming(db):
+    _load(db, _season(12))
+    with pytest.raises(ValueError):
+        build(db, upcoming=_upcoming(11))
+
+
 @atlas
 def test_written_docs_pass_validator_and_upsert(db):
     _load(db, _season(12))
