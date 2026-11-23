@@ -64,6 +64,52 @@ GAMES = _validator(
     },
 )
 
+SEASON_TYPE = {"enum": ["regular", "playoffs", "play_in", "cup_final"]}
+
+# One doc per team per game, league-wide. Raw box-score facts used for opponent strength
+# (defensive rating, pace); the rolling versions are computed in the feature pipeline.
+TEAM_GAMES = _validator(
+    ["game_id", "team_id", "team", "season", "season_type", "game_date", "opponent", "home",
+     "minutes", "pts", "opp_pts", "poss"],
+    {
+        "game_id": STR,
+        "team_id": INT,
+        "team": STR,
+        "season": STR,
+        "season_type": SEASON_TYPE,
+        "game_date": DATE,
+        "opponent": STR,
+        "home": BOOL,
+        "minutes": NONNEG,  # team minutes: 240, plus 25 per overtime
+        "pts": NONNEG,
+        "opp_pts": NONNEG,
+        "poss": NONNEG,  # estimated possessions, averaged over both teams
+    },
+)
+
+# One doc per player per game for Luka's team (Luka included). Who played and how much;
+# "key teammate out" is derived from earlier games in the feature pipeline.
+TEAM_PLAYER_GAMES = _validator(
+    ["game_id", "player_id", "name", "team", "season", "season_type", "game_date",
+     "minutes", "pts", "reb", "ast", "fga", "fta", "tov"],
+    {
+        "game_id": STR,
+        "player_id": INT,
+        "name": STR,
+        "team": STR,
+        "season": STR,
+        "season_type": SEASON_TYPE,
+        "game_date": DATE,
+        "minutes": NONNEG,
+        "pts": NONNEG,
+        "reb": NONNEG,
+        "ast": NONNEG,
+        "fga": NONNEG,
+        "fta": NONNEG,
+        "tov": NONNEG,
+    },
+)
+
 FEATURES = _validator(
     ["game_id", "player_id", "as_of", "computed_at", "values"],
     {
@@ -178,6 +224,20 @@ COLLECTIONS: dict[str, dict] = {
     },
     "players": {
         "indexes": [([("player_id", ASC)], {"unique": True})],
+    },
+    "team_games": {
+        "validator": TEAM_GAMES,
+        "indexes": [
+            ([("game_id", ASC), ("team_id", ASC)], {"unique": True}),
+            ([("team", ASC), ("game_date", DESC)], {}),
+        ],
+    },
+    "team_player_games": {
+        "validator": TEAM_PLAYER_GAMES,
+        "indexes": [
+            ([("game_id", ASC), ("player_id", ASC)], {"unique": True}),
+            ([("team", ASC), ("game_date", DESC)], {}),
+        ],
     },
     "injury_reports": {
         "timeseries": {"timeField": "reported_at", "metaField": "meta", "granularity": "minutes"},

@@ -6,7 +6,7 @@ requested. Each game is upserted by game_id, so re-running updates rows and neve
 them. Run it after every game day to pick up new games.
 
     python -m luka.ingest.games                      # whole career
-    python -m luka.ingest.games --current            # this season only (the daily update)
+    python -m luka.ingest.games --current            # this season only, plus team data (the daily update)
     python -m luka.ingest.games --season 2024-25     # one season; repeatable
     python -m luka.ingest.games --dry-run            # fetch and print, write nothing
 """
@@ -92,25 +92,28 @@ def game_doc(row: dict) -> dict | None:
 
 
 def fetch_rows(season: str, season_type: str) -> list[dict]:
-    """One season of Luka's game logs from stats.nba.com, with retries and a timeout.
-
-    stats.nba.com often stalls or returns an HTML block page instead of JSON (common from cloud
-    IPs). Both surface as exceptions here, so we retry with growing pauses, then give up.
-    """
+    """One season of Luka's game logs from stats.nba.com."""
     from nba_api.stats.endpoints import playergamelogs  # slow import; keep it out of tests
 
+    return call_stats_api(
+        playergamelogs.PlayerGameLogs, "PlayerGameLogs", f"{season} {season_type}",
+        player_id_nullable=PLAYER_ID, season_nullable=season, season_type_nullable=season_type,
+    )
+
+
+def call_stats_api(endpoint, result_key: str, label: str, **params) -> list[dict]:
+    """Call one nba_api endpoint with retries and a timeout; return its rows as dicts.
+
+    stats.nba.com often stalls or returns an HTML block page instead of JSON (common from cloud
+    IPs). Both surface as exceptions here, so we retry with growing pauses, then raise
+    RuntimeError so the caller can log it and move on to the next request.
+    """
     for attempt in range(1, RETRIES + 1):
         try:
-            resp = playergamelogs.PlayerGameLogs(
-                player_id_nullable=PLAYER_ID,
-                season_nullable=season,
-                season_type_nullable=season_type,
-                timeout=TIMEOUT_S,
-            )
-            return resp.get_normalized_dict()["PlayerGameLogs"]
+            return endpoint(timeout=TIMEOUT_S, **params).get_normalized_dict()[result_key]
         except (requests.RequestException, ValueError, KeyError) as e:  # ValueError covers bad JSON
             if attempt == RETRIES:
-                raise RuntimeError(f"{season} {season_type}: {type(e).__name__}: {e}") from e
+                raise RuntimeError(f"{label}: {type(e).__name__}: {e}") from e
             time.sleep(2**attempt)
     raise AssertionError("unreachable")
 
@@ -171,7 +174,13 @@ def main() -> None:
     else:
         seasons = args.season or career_seasons(today)
     db = None if args.dry_run else get_db()
-    sys.exit(0 if run(db, seasons, dry_run=args.dry_run) else 1)
+    ok = run(db, seasons, dry_run=args.dry_run)
+    if args.current and not args.dry_run:
+        # The daily scheduled task runs only this module, so it refreshes team data too.
+        from luka.ingest import teams
+
+        ok &= teams.run(db, seasons)
+    sys.exit(0 if ok else 1)
 
 
 if __name__ == "__main__":

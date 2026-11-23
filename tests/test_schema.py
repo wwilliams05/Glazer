@@ -12,7 +12,7 @@ from luka.db.schema import COLLECTIONS, ensure_schema
 load_dotenv()
 
 PRD_COLLECTIONS = {
-    "games", "players", "injury_reports", "market_snapshots", "news", "features",
+    "games", "players", "team_games", "team_player_games", "injury_reports", "market_snapshots", "news", "features",
     "predictions", "paper_trades", "strategy_configs", "agent_runs", "raw_api_cache",
 }
 
