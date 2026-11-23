@@ -24,6 +24,25 @@ Companion to [PRD.md](PRD.md). One milestone at a time: build, test, commit. Wee
 - [x] Schedule market snapshots: `.github/workflows/market-snapshots.yml`, every 15 min, needs repo secret `MONGODB_URI` and Atlas Network Access `0.0.0.0/0`. Runs only from `main`
 - [x] Script: season-average baseline MAE (`python -m luka.model.baseline`). As of 2026-11-16: PTS 6.63, REB 2.52, AST 2.65 over 580 games; 2025-26 on: PTS 7.37, REB 2.60, AST 2.53 (76 games)
 
+## Week 2 checklist
+
+- [x] `ingest/teams.py`: league-wide `team_games` (opponent defense, pace) and `team_player_games` for Luka's teams (teammates out). Refreshed daily by `games --current`
+- [x] `features/pipeline.py` (version `f1`): rolling 5/10 and season-to-date form, rest, back-to-backs, home, opponent defensive rating and pace relative to the league, rotation teammates out and their share of shot volume. Windows end before the game; a test proves later games never change earlier features. Historical rows use who actually played (`availability_source: box_score`) as a stand-in for the injury report
+- [x] `model/train.py` (version `m2`): predicts an adjustment to the season-average baseline; ridge, gradient boosting and "no adjustment" compete on a walk-forward over 2021-22 to 2024-25; residuals from the same walk-forward give the 80% range and P(stat ≥ k)
+- [ ] Projected minutes as its own model input (deferred: minutes averages are features, but no separate projection yet)
+
+**Results (2026-11-22, test = 2025-26 onward, 79 games):**
+
+| Stat | Chosen | Test MAE | Baseline | Gain (90% CI) | 80% range coverage |
+|---|---|---|---|---|---|
+| PTS | gradient boosting | 7.26 | 7.42 | +0.16 (−0.27 to +0.60) | 77% |
+| REB | baseline | 2.57 | 2.57 | 0 | 76% |
+| AST | ridge (≈ baseline) | 2.43 | 2.46 | +0.03 (−0.01 to +0.07) | 84% |
+
+Range coverage meets the 70–90% target for all three. Beating the baseline is **not proven**: the PTS gain has the right sign in both the walk-forward and the test, but its interval includes zero.
+
+**Holdout caveat:** the first version (`m1`: raw-stat target, models chosen on 2024-25 alone) lost to the baseline on the test games (PTS 7.95, REB 2.98, AST 2.41). `m2` was designed after seeing that, so the 2025-26+ games are no longer a clean holdout. The clean check is live games from 2026-11-23 on, scored by the week 4 scoring job.
+
 ## Repo layout
 
 ```
