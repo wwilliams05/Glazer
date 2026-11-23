@@ -80,7 +80,7 @@ TEAM_GAMES = _validator(
         "game_date": DATE,
         "opponent": STR,
         "home": BOOL,
-        "minutes": NONNEG,  # team minutes: 240, plus 25 per overtime
+        "minutes": NONNEG,  # game length as stats.nba.com reports it: 48, plus 5 per overtime
         "pts": NONNEG,
         "opp_pts": NONNEG,
         "poss": NONNEG,  # estimated possessions, averaged over both teams
@@ -118,6 +118,9 @@ FEATURES = _validator(
         "as_of": DATE,  # only data timestamped before this may feed the values
         "computed_at": DATE,
         "pipeline_version": STR,
+        # Where teammate availability came from: who actually played (historical rows, a
+        # stand-in) or the pre-game injury report (live rows).
+        "availability_source": {"enum": ["box_score", "injury_report"]},
         "values": {"bsonType": "object"},
         "notes": {
             "bsonType": "array",
@@ -257,7 +260,11 @@ COLLECTIONS: dict[str, dict] = {
     },
     "features": {
         "validator": FEATURES,
-        "indexes": [([("game_id", ASC), ("as_of", DESC)], {})],
+        "indexes": [
+            ([("game_id", ASC), ("as_of", DESC)], {}),
+            # Natural key for upserts: one doc per game, pipeline version and decision time.
+            ([("game_id", ASC), ("pipeline_version", ASC), ("as_of", ASC)], {"unique": True}),
+        ],
     },
     "predictions": {
         "validator": PREDICTIONS,
