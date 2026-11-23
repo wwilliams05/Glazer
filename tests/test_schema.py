@@ -14,6 +14,7 @@ load_dotenv()
 PRD_COLLECTIONS = {
     "games", "players", "team_games", "team_player_games", "injury_reports", "market_snapshots", "news", "features",
     "predictions", "paper_trades", "strategy_configs", "agent_runs", "raw_api_cache",
+    "schedule",  # added 2026-11-22: game_id and tip-off for games not yet played (AGENTS.md risk 3)
 }
 
 
@@ -99,6 +100,7 @@ def db():
 @atlas
 def test_valid_prediction_and_trade_insert(db):
     db.predictions.insert_one(copy.deepcopy(PREDICTION))
+    db.predictions.insert_one(_with(PREDICTION, model_version="with-tip", tip_off=T0 + timedelta(hours=2)))
     db.paper_trades.insert_one(copy.deepcopy(TRADE))
 
 
@@ -110,8 +112,13 @@ def test_valid_prediction_and_trade_insert(db):
         _with(PREDICTION, prediction=45.0),  # outside its own range
         _with(PREDICTION, market={"venue": "kalshi", "snapshot_at": T0 + timedelta(minutes=1)}),  # lookahead
         {k: v for k, v in PREDICTION.items() if k != "drivers"},
+        _with(PREDICTION, tip_off=T0),  # made at tip-off, not before
+        _with(PREDICTION, tip_off=T0 - timedelta(hours=1)),  # made after tip-off
+        _with(PREDICTION, tip_off=T0 + timedelta(minutes=5), created_at=T0 + timedelta(minutes=10)),  # written after
+        _with(PREDICTION, created_at=T0 - timedelta(minutes=1)),  # written before its own as_of
     ],
-    ids=["bad-stat", "outside-range", "future-market-price", "missing-drivers"],
+    ids=["bad-stat", "outside-range", "future-market-price", "missing-drivers", "at-tip-off", "after-tip-off",
+         "written-after-tip-off", "written-before-as-of"],
 )
 def test_bad_prediction_rejected(db, bad):
     with pytest.raises(WriteError):

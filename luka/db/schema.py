@@ -110,6 +110,27 @@ TEAM_PLAYER_GAMES = _validator(
     },
 )
 
+# One doc per game of Luka's team, played or not. The source of game_id and tip-off for games
+# that haven't happened yet (games holds finished games only). Upserted daily by game_id.
+SCHEDULE = _validator(
+    ["game_id", "game_key", "season", "season_type", "game_date", "tip_off", "team", "opponent", "home",
+     "status", "updated_at"],
+    {
+        "game_id": STR,
+        "game_key": STR,  # "2026-11-23_UTA_LAL", joins to market_snapshots.meta.game_key
+        "season": STR,
+        "season_type": SEASON_TYPE,
+        "game_date": DATE,  # US Eastern date as midnight UTC, like games.game_date
+        "tip_off": DATE,
+        "tip_time_tbd": BOOL,
+        "team": STR,
+        "opponent": STR,
+        "home": BOOL,
+        "status": {"enum": ["scheduled", "live", "final", "postponed"]},
+        "updated_at": DATE,
+    },
+)
+
 FEATURES = _validator(
     ["game_id", "player_id", "as_of", "computed_at", "values"],
     {
@@ -118,9 +139,13 @@ FEATURES = _validator(
         "as_of": DATE,  # only data timestamped before this may feed the values
         "computed_at": DATE,
         "pipeline_version": STR,
-        # Where teammate availability came from: who actually played (historical rows, a
-        # stand-in) or the pre-game injury report (live rows).
-        "availability_source": {"enum": ["box_score", "injury_report"]},
+        # Where teammate availability came from:
+        #   box_score       who actually played in this game (historical rows; a stand-in)
+        #   last_box_score  who played in the team's previous game (live rows until injury ingestion exists)
+        #   injury_report   the pre-game injury report (live rows, week 4 on)
+        "availability_source": {"enum": ["box_score", "last_box_score", "injury_report"]},
+        "inputs_through": DATE,  # date of the latest game the values were built from
+        "warnings": {"bsonType": "array", "items": STR},  # e.g. missing inputs, filled-in values
         "values": {"bsonType": "object"},
         "notes": {
             "bsonType": "array",
@@ -133,11 +158,15 @@ PREDICTIONS = _validator(
     ["game_id", "stat", "model_version", "as_of", "created_at", "prediction", "range", "strike_probs", "drivers"],
     {
         "game_id": STR,
+        "game_key": STR,
         "stat": STAT,
         "model_version": STR,
         "features_id": OID,
         "as_of": DATE,
         "created_at": DATE,
+        "tip_off": DATE,  # from schedule, at prediction time
+        "baseline": NONNEG,  # season average to date; the prediction is this plus the model's adjustment
+        "model": {"bsonType": "object"},  # {kind, params} of the model that made it
         "prediction": NONNEG,
         "range": _schema(["level", "low", "high"], {"level": PROB, "low": NONNEG, "high": NONNEG}),
         "strike_probs": {
@@ -147,11 +176,17 @@ PREDICTIONS = _validator(
         "drivers": {
             "bsonType": "array",
             "maxItems": 10,
-            "items": _schema(["feature", "effect"], {"feature": STR, "effect": NUM, "label": STR}),
+            # effect: how much this feature moved the prediction away from the season average
+            "items": _schema(["feature", "effect"], {"feature": STR, "effect": NUM, "label": STR, "value": NUM}),
         },
         "market": {
             "bsonType": ["object", "null"],
-            "properties": {"venue": {"enum": VENUES}, "snapshot_at": DATE},
+            "properties": {
+                "venue": {"enum": VENUES},
+                "snapshot_at": DATE,
+                "game_key": STR,
+                "strikes": {"bsonType": "array", "items": NONNEG},  # the ladder listed at snapshot_at
+            },
         },
         "actual": {"bsonType": ["number", "null"]},
         "error": {"bsonType": ["number", "null"]},
@@ -160,6 +195,12 @@ PREDICTIONS = _validator(
     {"$lte": ["$prediction", "$range.high"]},
     # No lookahead: the market price shown with a prediction must predate its as_of.
     {"$lte": ["$market.snapshot_at", "$as_of"]},
+    # A prediction that records its tip-off must be made before it. (Optional field: in $expr a
+    # missing field sorts below every date, so a plain $lt would reject docs without one.)
+    {"$or": [{"$eq": [{"$type": "$tip_off"}, "missing"]}, {"$lt": ["$as_of", "$tip_off"]}]},
+    # ...and written before it, too: created_at is when the doc was written, at or after as_of.
+    {"$or": [{"$eq": [{"$type": "$tip_off"}, "missing"]}, {"$lt": ["$created_at", "$tip_off"]}]},
+    {"$lte": ["$as_of", "$created_at"]},
 )
 
 PAPER_TRADES = _validator(
@@ -242,6 +283,13 @@ COLLECTIONS: dict[str, dict] = {
             ([("team", ASC), ("game_date", DESC)], {}),
         ],
     },
+    "schedule": {
+        "validator": SCHEDULE,
+        "indexes": [
+            ([("game_id", ASC)], {"unique": True}),
+            ([("team", ASC), ("tip_off", ASC)], {}),
+        ],
+    },
     "injury_reports": {
         "timeseries": {"timeField": "reported_at", "metaField": "meta", "granularity": "minutes"},
         "indexes": [([("meta.player_id", ASC), ("reported_at", DESC)], {})],
@@ -269,6 +317,7 @@ COLLECTIONS: dict[str, dict] = {
     "predictions": {
         "validator": PREDICTIONS,
         "indexes": [
+            # Also what makes predictions write-once: a second insert for the same game fails.
             ([("game_id", ASC), ("stat", ASC), ("model_version", ASC)], {"unique": True}),
             ([("created_at", DESC)], {}),
         ],

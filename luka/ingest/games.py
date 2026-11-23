@@ -6,7 +6,7 @@ requested. Each game is upserted by game_id, so re-running updates rows and neve
 them. Run it after every game day to pick up new games.
 
     python -m luka.ingest.games                      # whole career
-    python -m luka.ingest.games --current            # this season only, plus team data (the daily update)
+    python -m luka.ingest.games --current            # this season only, plus team data and schedule (the daily update)
     python -m luka.ingest.games --season 2024-25     # one season; repeatable
     python -m luka.ingest.games --dry-run            # fetch and print, write nothing
 """
@@ -176,10 +176,12 @@ def main() -> None:
     db = None if args.dry_run else get_db()
     ok = run(db, seasons, dry_run=args.dry_run)
     if args.current and not args.dry_run:
-        # The daily scheduled task runs only this module, so it refreshes team data too.
-        from luka.ingest import teams
+        # The daily scheduled task runs only this module, so it refreshes team data and the
+        # schedule (tip-off times for live predictions) too.
+        from luka.ingest import schedule, teams
 
         ok &= teams.run(db, seasons)
+        ok &= schedule.run(db, seasons[0])
     sys.exit(0 if ok else 1)
 
 
