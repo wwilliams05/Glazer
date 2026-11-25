@@ -82,6 +82,19 @@ RPS = ranked probability score, the squared error of P(stat ≥ k) summed over e
 - [ ] Not tried yet: opponent rebounds and assists allowed (needs those columns in `team_games`), injury reports (week 4), market prices as an input
 - [x] `model/score.py` (pulled forward from week 4): after each game, sets `actual`, `error`, `in_range`, `rps`, or `void` if Luka sat. Runs inside `games --current`; `python -m luka.model.score --report` prints the live track record per model version and the paired m2-vs-m3 comparison. Waits for `schedule` to say final; voids postponed or moved games. Unchecked: whether stats.nba.com files a Cup final (game id 006…) under a season type `games.py` requests; if not, such a prediction waits forever
 
+## Model vs market (research, 2026-11-25; early input for the week 5 backtest)
+
+`scripts/research/market_bench.py`: every archived Kalshi Luka strike (51 games, 2025-12-01 to 2026-03-31), last hourly quote at or before tip-off, settled yes or no. Brier score = mean (probability − outcome)², lower is better. Models trained on seasons before 2025-26.
+
+| Strikes | n | Kalshi mid | m2 | m3 |
+|---|---|---|---|---|
+| All with a pre-tip quote | 651 (51 games) | 0.204 | 0.187 | 0.188 |
+| Spread ≤ 5¢ (liquid) | 297 (41 games) | 0.186 | 0.183 | 0.183 |
+
+- The "all strikes" gap is mostly wide-spread quotes whose mid isn't a real opinion (bid 0, ask 0.99 → 0.50).
+- **On liquid strikes the model is roughly even with the market:** market minus model Brier +0.003 (90% interval over games −0.005 to +0.012 for m3; similar for m2). Not a demonstrated edge, and optimistic because m2 and m3 were designed with these games' aggregate numbers visible.
+- **Paper trades pay the ask plus fees,** so parity with the mid loses money on average. Any edge has to come from strikes where model and price disagree by more than the spread plus fees; the week 5 backtest should measure exactly that, with the strategy rule fixed before it is run.
+
 ## Repo layout
 
 ```
