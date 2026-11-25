@@ -9,6 +9,7 @@ from luka.features.pipeline import FEATURE_COLUMNS, PIPELINE_VERSION, build, fea
 from luka.ingest import markets
 from luka.model import predict
 from luka.model.predict import drivers, fill_missing, strike_grid, write_once
+from luka.model import m3
 from luka.model.train import MODEL_VERSION, fit_adjustment
 from test_features import _load, _season, day, db  # noqa: F401  (db is a fixture; pytest puts tests/ on the path)
 
@@ -100,7 +101,7 @@ def _setup(db, monkeypatch):
 def test_prediction_is_written_once_before_tip_off(db, monkeypatch):
     now = _setup(db, monkeypatch)
     assert predict.due_games(db, TIP - timedelta(hours=3)) == []  # too early
-    assert predict.run(db, now, card=_card())
+    assert predict.run(db, now, card=_card(), versions=("m2",))
 
     preds = {p["stat"]: p for p in db.predictions.find({"model_version": MODEL_VERSION})}
     assert set(preds) == {"pts", "reb", "ast"}
@@ -120,7 +121,7 @@ def test_prediction_is_written_once_before_tip_off(db, monkeypatch):
 
     # A later run, even with new data, must not touch the stored prediction.
     db.games.update_many({}, {"$inc": {"pts": 10}})
-    assert predict.run(db, now + timedelta(minutes=15), card=_card())
+    assert predict.run(db, now + timedelta(minutes=15), card=_card(), versions=("m2",))
     again = db.predictions.find_one({"_id": pts["_id"]})
     assert again == pts
     assert db.predictions.count_documents({}) == 3 and db.features.count_documents({"availability_source": "last_box_score"}) == 1
@@ -146,7 +147,7 @@ def test_losing_a_race_leaves_the_first_prediction(db, monkeypatch):
 def test_a_run_that_finishes_after_tip_off_writes_nothing(db, monkeypatch):
     now = _setup(db, monkeypatch)
     monkeypatch.setattr(predict, "utcnow", lambda: TIP + timedelta(minutes=1))  # laptop slept mid-run
-    assert not predict.run(db, now, card=_card())
+    assert not predict.run(db, now, card=_card(), versions=("m2",))
     assert db.predictions.count_documents({}) == 0 and db.features.count_documents({"availability_source": "last_box_score"}) == 0
 
 
@@ -167,3 +168,40 @@ def test_markets_skip_quiet_days_only_with_a_fresh_schedule(db, monkeypatch):
     assert markets.quiet_until(db, TIP - timedelta(hours=40)) == TIP  # 40 h out: skip
     assert markets.quiet_until(db, TIP - timedelta(hours=20)) is None  # within 30 h: run
     assert markets.quiet_until(db, fresh + timedelta(days=4)) is None  # stale schedule: run
+
+
+def _m3_card(members=("season_gbm", "ew_ridge300")):
+    return {"model_version": "m3", "pipeline_version": "f2", "range_level": 0.8,
+            "stats": {s: {"members": list(members), "residuals": RESIDUALS} for s in ("pts", "reb", "ast")}}
+
+
+def test_saved_m3_card_matches_the_code():
+    card = m3.load_card()  # raises if the features or components changed since the card was made
+    assert set(card["stats"]) == {"pts", "reb", "ast"}
+    assert card["dev_cutoff"].startswith("2026-11-23")  # chosen before the first live game
+
+
+@atlas
+def test_m3_runs_beside_m2_without_touching_it(db, monkeypatch):
+    now = _setup(db, monkeypatch)
+    assert predict.run(db, now, cards={"m2": _card(), "m3": _m3_card()})
+    by_version = {}
+    for p in db.predictions.find():
+        by_version.setdefault(p["model_version"], {})[p["stat"]] = p
+    assert set(by_version) == {"m2", "m3"} and all(len(v) == 3 for v in by_version.values())
+    p3 = by_version["m3"]["pts"]
+    assert p3["model"]["members"] == ["season_gbm", "ew_ridge300"]
+    assert p3["range"]["low"] <= p3["prediction"] <= p3["range"]["high"] and p3["as_of"] < p3["tip_off"]
+    assert p3["market"]["strikes"] == [25, 30]
+    f3 = db.features.find_one({"_id": p3["features_id"]})
+    assert f3["pipeline_version"] == "f2" and "pts_ew10" in f3["values"]
+    f2 = db.features.find_one({"_id": by_version["m2"]["pts"]["features_id"]})
+    assert f2["pipeline_version"] == "f1" and "pts_ew10" not in f2["values"]  # m2's inputs unchanged
+
+
+@atlas
+def test_a_broken_m3_still_lets_m2_write(db, monkeypatch):
+    now = _setup(db, monkeypatch)
+    assert not predict.run(db, now, cards={"m2": _card(), "m3": {"stats": {}, "range_level": 0.8}})  # m3 fails
+    assert {p["model_version"] for p in db.predictions.find()} == {"m2"}
+    assert db.predictions.count_documents({}) == 3

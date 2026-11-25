@@ -12,6 +12,9 @@ Three groups of features, each from its own source:
    rolling number: which rotation players from the team's last 10 games are missing from
    this game, and what share of the team's shot volume they took.
 
+4. Recency-weighted form (f2 only): exponentially weighted averages of PTS, REB, AST and
+   minutes over Luka's earlier games, across seasons. pandas, on the same frame.
+
 as_of is midnight UTC on the game's (US Eastern) date. Groups 1 and 2 use only games from
 earlier dates. Group 3 uses who actually played, a stand-in for the pre-game injury report;
 availability_source records that, so live rows (from the injury report) can be told apart.
@@ -37,6 +40,11 @@ from luka.config import PLAYER_ID
 
 PIPELINE_VERSION = "f1"
 FORM_STATS = ["pts", "reb", "ast", "minutes"]
+# f2 = f1 plus recency-weighted averages (used by m3). build() returns both; f1 docs keep
+# storing FEATURE_COLUMNS only, so f1 values are unchanged.
+PIPELINE_VERSION_F2 = "f2"
+EW_HALF_LIFE = 10  # games
+EW_COLUMNS = [f"{s}_ew{EW_HALF_LIFE}" for s in FORM_STATS]
 OPP_WINDOW = 20  # opponent games
 TEAM_WINDOW = 10  # team games used to decide who is in the rotation
 ROTATION_MIN_MINUTES = 20.0
@@ -255,7 +263,26 @@ def build(db, player_id: int = PLAYER_ID, upcoming: dict | None = None) -> pd.Da
 
     df = (form.merge(opp[["game_id", "opp_def_rtg_rel", "opp_pace_rel"]], on="game_id", how="left")
               .merge(mates, on="game_id", how="left"))
-    return df.sort_values("game_date").reset_index(drop=True)[["game_id", "game_date", "season", *FEATURE_COLUMNS]]
+    df = df.sort_values(["game_date", "game_id"], kind="stable").reset_index(drop=True)
+    if upcoming is not None and df["game_id"].iloc[-1] != upcoming["game_id"]:
+        raise ValueError(f"placeholder {upcoming['game_id']} isn't the latest row; EW windows would see later games")
+    df = add_ew_features(df, games)
+    return df[["game_id", "game_date", "season", *FEATURE_COLUMNS, *EW_COLUMNS]]
+
+
+def add_ew_features(df: pd.DataFrame, games: pd.DataFrame) -> pd.DataFrame:
+    """Recency-weighted averages of Luka's earlier games, across seasons (f2 only).
+
+    An exponentially weighted mean with a 10-game half-life: last game counts 1, the game ten
+    games back counts 1/2, twenty back 1/4. shift(1) first, so each row sees only the games
+    before it; the upcoming placeholder has no stats of its own and sees all of them.
+    df must be sorted by game_date, one row per Luka game (plus the placeholder).
+    """
+    out = df.copy()
+    stats = out[["game_id"]].merge(games[["game_id", *FORM_STATS]], on="game_id", how="left")
+    for s in FORM_STATS:
+        out[f"{s}_ew{EW_HALF_LIFE}"] = stats[s].shift(1).ewm(halflife=EW_HALF_LIFE).mean().to_numpy()
+    return out
 
 
 def _clean(v):

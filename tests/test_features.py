@@ -7,7 +7,8 @@ from dotenv import load_dotenv
 
 from luka.db.schema import ensure_schema
 from luka.features.pipeline import (
-    FEATURE_COLUMNS, add_form_fallbacks, build, feature_docs, opponent_features, teammate_features, write,
+    EW_COLUMNS, FEATURE_COLUMNS, add_ew_features, add_form_fallbacks, build, feature_docs, opponent_features,
+    teammate_features, write,
 )
 
 load_dotenv()
@@ -68,6 +69,17 @@ def test_rest_days_and_season_opener_fallback():
     df = add_form_fallbacks(form, games).iloc[0]
     assert df["pts_season"] == 25  # last season's average
     assert df["rest_days"] == 5 and df["back_to_back"] == 0  # capped at 5
+
+
+def test_ew_average_uses_earlier_games_only():
+    # Luka scores 10, 20, 30; then an upcoming game with no stats yet.
+    df = pd.DataFrame({"game_id": ["A", "B", "C", "NEXT"]})
+    games = pd.DataFrame({"game_id": ["A", "B", "C"], "pts": [10, 20, 30], "reb": 5, "ast": 5, "minutes": 30})
+    ew = add_ew_features(df, games)["pts_ew10"].tolist()
+    assert pd.isna(ew[0]) and ew[1] == 10  # first game: no history; second: only the first
+    w = 0.5 ** (1 / 10)  # weight per game back, for a 10-game half-life
+    assert ew[3] == pytest.approx((30 + 20 * w + 10 * w * w) / (1 + w + w * w))  # placeholder sees all three
+    assert 20 < ew[3] < 30  # recent games count more than in a plain average
 
 
 def test_opponent_features_need_five_games():
@@ -173,7 +185,7 @@ def test_upcoming_placeholder_gets_the_same_features_as_the_played_game(db):
     played = build(db).set_index("game_id").loc["0022500012"]
     _load(db, _season(12))
     live = build(db, upcoming=_upcoming(12)).set_index("game_id").loc["0022500012"]
-    same = [c for c in FEATURE_COLUMNS if c not in ("n_rotation_out", "usage_share_out", "top_teammate_out")]
+    same = [c for c in FEATURE_COLUMNS + EW_COLUMNS if c not in ("n_rotation_out", "usage_share_out", "top_teammate_out")]
     pd.testing.assert_series_equal(live[same], played[same])
     # Player 1 sat game 11, the last box score, so the live row assumes he's out again;
     # in the real game 12 he played.
@@ -185,7 +197,7 @@ def test_upcoming_placeholder_leaves_historical_rows_unchanged(db):
     _load(db, _season(12))
     without = build(db).set_index("game_id")
     with_ = build(db, upcoming=_upcoming(12)).set_index("game_id").loc[without.index]
-    pd.testing.assert_frame_equal(without[FEATURE_COLUMNS], with_[FEATURE_COLUMNS])
+    pd.testing.assert_frame_equal(without[FEATURE_COLUMNS + EW_COLUMNS], with_[FEATURE_COLUMNS + EW_COLUMNS])
 
 
 @atlas

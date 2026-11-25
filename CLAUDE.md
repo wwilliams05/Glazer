@@ -26,7 +26,8 @@ Predicts Luka Dončić's PTS, REB and AST, explains why, and paper-trades the pr
 
 - **Market snapshots** run every 15 min two ways: GitHub Actions (`.github/workflows/market-snapshots.yml`, unreliable timing) and the Windows task "Glazer market snapshots" (`pythonw scripts/run_logged.py markets_snapshots.log luka.ingest.markets`). The same run then calls `luka.model.predict`, which writes live predictions ~2 h before tip-off; on days with no game within 30 h it exits after one query.
 - **Game logs, team data and schedule** run daily via the Windows task "Glazer game logs" (`pythonw scripts/run_logged.py games_update.log luka.ingest.games --current`). stats.nba.com blocks GitHub's servers, so this can't move to Actions.
-- **Predictions are write-once.** Never update or delete a `predictions` doc before its game. Check a prediction without writing: `python -m luka.model.predict --dry-run --game-id <id>`. `luka/model/cards/m2.json` is frozen; a model change is a new `MODEL_VERSION`.
+- **Predictions are write-once.** Never update or delete a `predictions` doc before its game. Check a prediction without writing: `python -m luka.model.predict --dry-run --game-id <id>`. Two model versions run side by side: `m2` (f1 features) and `m3` (f2, `luka/model/m3.py`). Their cards in `luka/model/cards/` are frozen; a model change is a new `MODEL_VERSION`.
+- **Don't look at live results while designing a model.** A new version is built from games before its cutoff date, so later live games stay a clean test of it.
 - Logs (`*.log`) are in the repo root and git-ignored. `scripts/run_logged.py` waits for the network before running.
 - Claude Code's permission check blocks creating or changing Windows scheduled tasks. Give the owner a PowerShell command to paste instead.
 - **Git:** one branch per milestone (e.g. `week2-features`), commit per step with tests passing, then fast-forward `main` and push.

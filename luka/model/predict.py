@@ -5,10 +5,14 @@ Runs inside the 15-minute market snapshot task, right after the snapshots. Each 
 1. finds games in `schedule` that tip off within PREDICT_LEAD and are missing a prediction,
 2. fixes as_of = now (the decision time, before tip-off) and builds the game's features from
    games before its date, assuming whoever played the team's last game plays this one,
-3. refits m2's chosen model per stat (from luka/model/cards/m2.json) on every finished game
-   before this one,
+3. refits each model version's chosen model per stat (from luka/model/cards/<version>.json)
+   on every finished game before this one,
 4. reads the latest Kalshi ladder snapshotted at or before as_of,
-5. inserts one features doc and one predictions doc per stat.
+5. inserts one features doc and one predictions doc per stat, per model version.
+
+Model versions run side by side so live games can compare them: m2 (f1 features, the week 2
+model) first, then m3 (f2 features; luka/model/m3.py). Each version is tried separately, so a
+failure in m3 can't cost the m2 prediction.
 
 Write once (docs/AGENTS.md, risk 2): predictions are only ever inserted. The unique index on
 (game_id, stat, model_version) makes a second insert fail, so a later run, or the GitHub
@@ -27,7 +31,7 @@ import pandas as pd
 from pymongo.errors import BulkWriteError, DuplicateKeyError
 
 from luka.config import PLAYER_ID, TEAM
-from luka.features.pipeline import FEATURE_COLUMNS, PIPELINE_VERSION, build
+from luka.features.pipeline import EW_COLUMNS, FEATURE_COLUMNS, PIPELINE_VERSION, build
 from luka.model.train import MODEL_VERSION, STATS, fit_adjustment, load_card, load_dataset, p_at_least, prediction_range
 
 PREDICT_LEAD = timedelta(hours=2)
@@ -68,8 +72,8 @@ def due_games(db, now: datetime) -> list[dict]:
     }).sort("tip_off", 1))
 
 
-def missing_stats(db, game_id: str) -> list[str]:
-    have = set(db.predictions.distinct("stat", {"game_id": game_id, "model_version": MODEL_VERSION}))
+def missing_stats(db, game_id: str, model_version: str = MODEL_VERSION) -> list[str]:
+    have = set(db.predictions.distinct("stat", {"game_id": game_id, "model_version": model_version}))
     return [s for s in STATS if s not in have]
 
 
@@ -104,9 +108,9 @@ def live_row(db, game: dict) -> pd.Series:
     return row.iloc[0]
 
 
-def fill_missing(x: pd.Series, train: pd.DataFrame) -> tuple[pd.Series, list[str]]:
+def fill_missing(x: pd.Series, train: pd.DataFrame, columns: list[str] = FEATURE_COLUMNS) -> tuple[pd.Series, list[str]]:
     """Ridge can't take a missing value; use the training average and say so."""
-    missing = [c for c in FEATURE_COLUMNS if pd.isna(x[c])]
+    missing = [c for c in columns if pd.isna(x[c])]
     x = x.copy()
     for c in missing:
         x[c] = train[c].mean()
@@ -177,7 +181,7 @@ def predict_stat(stat: str, spec: dict, train: pd.DataFrame, x: pd.Series) -> di
 
 
 def prediction_docs(game: dict, as_of: datetime, features_id, card: dict, results: list[dict],
-                    ladders: dict[str, dict | None]) -> list[dict]:
+                    ladders: dict[str, dict | None], model_version: str = MODEL_VERSION) -> list[dict]:
     docs = []
     for r in results:
         ladder = ladders.get(r["stat"])
@@ -186,7 +190,7 @@ def prediction_docs(game: dict, as_of: datetime, features_id, card: dict, result
             "game_id": game["game_id"],
             "game_key": game["game_key"],
             "stat": r["stat"],
-            "model_version": MODEL_VERSION,
+            "model_version": model_version,
             "features_id": features_id,
             "as_of": as_of,
             "created_at": as_of,
@@ -250,6 +254,52 @@ def predict_game(db, game: dict, stats: list[str], now: datetime, card: dict | N
     return features, prediction_docs(game, as_of, None, card, results, ladders)
 
 
+def predict_game_m3(db, game: dict, stats: list[str], now: datetime, card: dict | None = None) -> tuple[dict, list[dict]]:
+    """m3's (features doc, predictions docs) for one game. Writes nothing.
+
+    Same steps and guards as predict_game; the differences are the f2 inputs (no teammate
+    features, plus the recency-weighted averages) and m3's ensembles.
+    """
+    from luka.model import m3  # imported here: if m3 breaks, m2 (which runs first) still works
+
+    card = card or m3.load_card()
+    as_of = now
+    game = {**game, "tip_off": earliest_tip_off(db, game, as_of)}
+    if as_of >= game["tip_off"]:
+        raise ValueError(f"{game['game_id']} tipped off at {game['tip_off']}; too late to predict")
+
+    warnings, through = input_warnings(db, game, now)
+    x = live_row(db, game)
+    # load_frame(until=game date) keeps finished games before this one only.
+    train = m3.load_frame(db, until=game["game_date"])
+    x, filled = fill_missing(x, train, m3.X_COLUMNS)
+    warnings += filled
+
+    stored = FEATURE_COLUMNS + EW_COLUMNS  # teammate values are kept for reading, not used by m3
+    features = {
+        "game_id": game["game_id"],
+        "player_id": PLAYER_ID,
+        "as_of": as_of,
+        "computed_at": now,
+        "pipeline_version": m3.PIPELINE_VERSION,
+        "availability_source": "last_box_score",
+        "values": {c: (None if pd.isna(x[c]) else round(float(x[c]), 4)) for c in stored},
+        "warnings": warnings,
+    }
+    if through is not None:
+        features["inputs_through"] = through
+
+    results = [m3.predict_stat(s, card["stats"][s], train, x, FEATURE_LABEL) for s in stats]
+    for r in results:
+        r["model"].update(train_rows=len(train), train_through=train["game_date"].max().to_pydatetime())
+    ladders = {s: latest_ladder(db, game["game_key"], s, as_of) for s in stats}
+    return features, prediction_docs(game, as_of, None, card, results, ladders, m3.MODEL_VERSION)
+
+
+# Live model versions, in the order they run. Each: (model_version, function building its docs).
+VERSIONS = {MODEL_VERSION: predict_game, "m3": predict_game_m3}
+
+
 def write_once(db, features: dict, preds: list[dict]) -> int:
     """Insert the features doc and the predictions. Returns how many predictions were new.
 
@@ -283,7 +333,8 @@ def write_once(db, features: dict, preds: list[dict]) -> int:
 
 
 def _summary(game: dict, features: dict, preds: list[dict]) -> str:
-    lines = [f"{game['game_key']} ({game['game_id']}) tip {game['tip_off']:%Y-%m-%d %H:%MZ}  as_of {features['as_of']:%H:%MZ}"]
+    version = preds[0]["model_version"] if preds else "?"
+    lines = [f"{game['game_key']} ({game['game_id']}) {version} tip {game['tip_off']:%Y-%m-%d %H:%MZ}  as_of {features['as_of']:%H:%MZ}"]
     for w in features["warnings"]:
         lines.append(f"  WARNING {w}")
     for p in preds:
@@ -296,23 +347,34 @@ def _summary(game: dict, features: dict, preds: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def run(db, now: datetime | None = None, dry_run: bool = False, card: dict | None = None) -> bool:
-    """Predict every due game that is missing a prediction. Returns False if any game failed."""
-    now = now or datetime.now(timezone.utc)
+def run(db, now: datetime | None = None, dry_run: bool = False, card: dict | None = None,
+        versions: tuple[str, ...] = tuple(VERSIONS), cards: dict[str, dict] | None = None) -> bool:
+    """Predict every due game that is missing a prediction, for each model version.
+    Returns False if anything failed.
+
+    card: m2's card (tests); cards: {model_version: card} for any version (tests).
+    """
+    fixed_now = now  # tests pass a time; live runs read the clock afresh for each version
+    now = now or utcnow()
+    cards = {**({MODEL_VERSION: card} if card else {}), **(cards or {})}
     ok = True
     for game in due_games(db, now):
-        stats = missing_stats(db, game["game_id"])
-        if not stats:
-            continue
-        try:
-            features, preds = predict_game(db, game, stats, now, card)
-            print(_summary(game, features, preds))
-            if not dry_run:
-                n = write_once(db, features, preds)
-                print(f"  wrote {n} prediction(s)" + ("" if n == len(preds) else "; the rest already existed"))
-        except Exception as e:  # one bad game must not stop the next, or the snapshots that ran first
-            print(f"  ERROR predicting {game['game_id']}: {type(e).__name__}: {e}")
-            ok = False
+        for version in versions:
+            stats = missing_stats(db, game["game_id"], version)
+            if not stats:
+                continue
+            try:  # separately per version and game: one failure must not stop the others
+                # as_of = when this version starts reading: m3 runs after m2 has finished, and
+                # everything it reads must predate its own as_of.
+                as_of = fixed_now or utcnow()
+                features, preds = VERSIONS[version](db, game, stats, as_of, cards.get(version))
+                print(_summary(game, features, preds))
+                if not dry_run:
+                    n = write_once(db, features, preds)
+                    print(f"  wrote {n} prediction(s)" + ("" if n == len(preds) else "; the rest already existed"))
+            except Exception as e:
+                print(f"  ERROR predicting {game['game_id']} {version}: {type(e).__name__}: {e}")
+                ok = False
     return ok
 
 
@@ -332,10 +394,11 @@ def main() -> None:
         game = db.schedule.find_one({"game_id": args.game_id})
         if game is None:
             sys.exit(f"{args.game_id} is not in schedule; run python -m luka.ingest.schedule")
-        features, preds = predict_game(db, game, STATS, now)
-        print(_summary(game, features, preds))
+        for build_docs in VERSIONS.values():
+            features, preds = build_docs(db, game, STATS, now)
+            print(_summary(game, features, preds))
         sys.exit(0)
-    sys.exit(0 if run(db, now, dry_run=args.dry_run) else 1)
+    sys.exit(0 if run(db, dry_run=args.dry_run) else 1)  # no `now`: each version reads the clock
 
 
 if __name__ == "__main__":
