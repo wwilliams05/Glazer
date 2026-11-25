@@ -129,6 +129,32 @@ def paired(db, a: str = "m2", b: str = "m3") -> dict[str, dict]:
     return out
 
 
+CALIBRATION_BINS = [0.0, 0.15, 0.3, 0.5, 0.7, 0.85, 1.0001]
+# Walk-forward reliability of m3 on ladder strikes (2026-11-25, PLAN.md): within 1-3 points per bin.
+
+
+def calibration(db, model_version: str) -> list[dict]:
+    """Reliability on the strikes the market listed: per probability bin, how often it happened.
+
+    Uses market.strikes (the ladder at prediction time), not the whole stored grid, whose far
+    strikes are near-certain and would make any model look calibrated. Well calibrated means
+    `happened` is close to `predicted` in every bin, given enough strikes.
+    """
+    pairs = []
+    q = {"model_version": model_version, "scored_at": {"$exists": True}, "void": {"$ne": True}}
+    for p in db.predictions.find(q, {"strike_probs": 1, "market": 1, "actual": 1}):
+        ladder = set((p.get("market") or {}).get("strikes", []))
+        pairs += [(s["p_at_least"], float(p["actual"] >= s["strike"])) for s in p["strike_probs"] if s["strike"] in ladder]
+    rows = []
+    for lo, hi in zip(CALIBRATION_BINS, CALIBRATION_BINS[1:]):
+        inside = [(pr, y) for pr, y in pairs if lo <= pr < hi]
+        if inside:
+            rows.append({"bin": f"{lo:.0%}-{min(hi, 1):.0%}", "strikes": len(inside),
+                         "predicted": float(np.mean([pr for pr, _ in inside])),
+                         "happened": float(np.mean([y for _, y in inside]))})
+    return rows
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--report", action="store_true", help="print the track record per model version")
@@ -151,6 +177,12 @@ def main() -> None:
         flag = "  (small sample)" if r["small_sample"] else ""
         print(f"  {stat}: {r['games']} games  RPS {r['rps_diff']:+.3f} (90% {lo:+.3f} to {hi:+.3f})  "
               f"MAE {r['mae_diff']:+.2f}{flag}")
+    for version in ("m2", "m3"):
+        rows = calibration(db, version)
+        if rows:
+            print(f"\n{version} calibration on listed strikes (all stats pooled; needs ~100+ strikes per bin to mean much):")
+            for r in rows:
+                print(f"  P {r['bin']:<8} {r['strikes']:>4} strikes  predicted {r['predicted']:.0%}  happened {r['happened']:.0%}")
 
 
 if __name__ == "__main__":

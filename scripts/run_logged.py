@@ -37,6 +37,9 @@ def wait_for_network(timeout_s: float = NETWORK_WAIT_S, step_s: float = 10) -> b
 
 def main() -> int:
     log_name, module, *args = sys.argv[1:]
+    # When the task started, before the network wait: luka.model.predict sizes its catch-up
+    # from what is left of the task's 5-minute limit.
+    os.environ["GLAZER_TASK_STARTED"] = str(time.time())
     os.chdir(ROOT)  # so .env is found and the luka package imports
     sys.path.insert(0, ROOT)
     code = 0

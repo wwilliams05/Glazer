@@ -82,6 +82,26 @@ RPS = ranked probability score, the squared error of P(stat ≥ k) summed over e
 - [ ] Not tried yet: opponent rebounds and assists allowed (needs those columns in `team_games`), injury reports (week 4), market prices as an input
 - [x] `model/score.py` (pulled forward from week 4): after each game, sets `actual`, `error`, `in_range`, `rps`, or `void` if Luka sat. Runs inside `games --current`; `python -m luka.model.score --report` prints the live track record per model version and the paired m2-vs-m3 comparison. Waits for `schedule` to say final; voids postponed or moved games. Unchecked: whether stats.nba.com files a Cup final (game id 006…) under a season type `games.py` requests; if not, such a prediction waits forever
 
+### Where the remaining error is (research, 2026-11-25 evening; m3 walk-forward, games before 2026-11-23)
+
+Each check below was planned as a possible m4; none earned one. With this data m3 looks close to the ceiling for Luka's box score.
+
+| Question | Finding |
+|---|---|
+| Is it minutes? | Knowing his actual minutes in advance would cut MAE only ~4% (PTS 6.34 → 6.09). Minutes vs expected: sd 5.2, 12% of games 6+ below. Most error is per-minute production, so no minutes model |
+| Is the error size predictable? | No. Scaling the residuals by a ridge model of \|error\| on rest, back-to-back, home, opponent and minutes made RPS slightly worse for all three stats; scaling by √prediction changed nothing |
+| Does the co-star sitting matter? | Not detectably, even with box-score truth: PTS error −0.20 when the top-usage teammate sat (90% −1.90 to +1.51, 93 games); REB/AST +0.2 to +0.4, intervals include 0. Injury reports matter for Luka's own status (voids), not for accuracy |
+| Are the probabilities calibrated? | Yes. On ladder-style strikes, predicted vs happened: 2.3% vs 2.9%, 9.4% vs 8.7%, 21.6% vs 20.5%, 39% vs 40%, 59% vs 62%, 78% vs 80%, 90.5% vs 90.3%, 97.7% vs 97.8% |
+| Report the median instead? | PTS 6.338 → 6.332, REB and AST slightly worse. No |
+| Mix m2 and m3 distributions? | Worse than m3 alone; m3 beats m2 on walk-forward RPS for all three (PTS 4.62 vs 4.76, REB 1.73 vs 1.76, AST 1.86 vs 1.91) |
+
+Not run on purpose: who is right where model and market disagree on the 51 archived games. That is a trading strategy; looking now would spend the only historical test of week 5's rules.
+
+### Keeping live inputs fresh
+
+- [x] `predict.catch_up`: if an earlier game tipped off without a team box score, or Luka's own log for it is missing, the laptop runs `games --current` in a separate process before predicting. Time limit: at most 75 s, less if the task's 5 minutes are partly used, and it must finish before tip-off − 75 min. Still missing with more than 90 min to go: wait for the next run; after that, predict with what we have (recorded in `features.warnings`). GitHub Actions never catches up and holds back an incomplete game only until tip-off − 75 min, so it keeps a fallback window when the laptop is off. A broken daily task now costs at most a stale prediction with a warning, not a silent one
+- [x] `score --report` prints live calibration on the strikes Kalshi listed, per version
+
 ## Model vs market (research, 2026-11-25; early input for the week 5 backtest)
 
 `scripts/research/market_bench.py`: every archived Kalshi Luka strike (51 games, 2025-12-01 to 2026-03-31), last hourly quote at or before tip-off, settled yes or no. Brier score = mean (probability − outcome)², lower is better. Models trained on seasons before 2025-26.

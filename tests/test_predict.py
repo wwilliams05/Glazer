@@ -73,6 +73,8 @@ KEY = "2025-12-01_BBB_AAA"  # day(40)
 
 
 def _setup(db, monkeypatch):
+    monkeypatch.delenv("GITHUB_ACTIONS", raising=False)  # same behaviour wherever the tests run
+    monkeypatch.delenv("GLAZER_TASK_STARTED", raising=False)
     monkeypatch.setattr(predict, "TEAM", "AAA")
     monkeypatch.setattr(markets, "TEAM", "AAA")
     # The run "finishes" 40 s after it starts (as_of), in the fixture's 2025.
@@ -205,3 +207,105 @@ def test_a_broken_m3_still_lets_m2_write(db, monkeypatch):
     assert not predict.run(db, now, cards={"m2": _card(), "m3": {"stats": {}, "range_level": 0.8}})  # m3 fails
     assert {p["model_version"] for p in db.predictions.find()} == {"m2"}
     assert db.predictions.count_documents({}) == 3
+
+
+def _missing_earlier_game(db):
+    """An earlier game that tipped off but has no box score: the daily task didn't run."""
+    db.schedule.insert_one({**db.schedule.find_one({}, {"_id": 0}), "game_id": "EARLIER", "game_key": "earlier",
+                            "game_date": day(2 * GAME - 1), "tip_off": day(2 * GAME - 1)})
+
+
+@atlas
+def test_no_catch_up_when_inputs_are_complete(db, monkeypatch):
+    now = _setup(db, monkeypatch)
+    calls = []
+    assert predict.run(db, now, cards={"m2": _card()}, versions=("m2",), load=lambda d, t: calls.append(t) or True)
+    assert calls == [] and db.predictions.count_documents({}) == 3
+
+
+@atlas
+def test_catch_up_runs_first_then_waits_for_box_scores_until_the_last_hour(db, monkeypatch):
+    now = _setup(db, monkeypatch)
+    _missing_earlier_game(db)
+    order = []
+    load = lambda d, t: order.append("load") or True  # "succeeds" but the box score still isn't there
+    real = predict.VERSIONS["m2"]
+    monkeypatch.setitem(predict.VERSIONS, "m2", lambda *a: (order.append("predict"), real(*a))[1])
+    # 1 h 50 min out: load, still missing, so wait for the next run instead of locking in stale inputs.
+    assert predict.run(db, now, cards={"m2": _card()}, versions=("m2",), load=load)
+    assert order == ["load"] and db.predictions.count_documents({}) == 0
+    # 80 min out: load again (it can finish before the 75-minute cutoff), still missing, but now
+    # predict with what we have and say so.
+    late = TIP - timedelta(minutes=80)
+    monkeypatch.setattr(predict, "utcnow", lambda: late + timedelta(seconds=40))
+    assert predict.run(db, late, cards={"m2": _card()}, versions=("m2",), load=load)
+    assert order == ["load", "load", "predict"] and db.predictions.count_documents({}) == 3
+    feats = db.features.find_one({"availability_source": "last_box_score"})
+    assert any("EARLIER" in w for w in feats["warnings"])
+
+
+@atlas
+def test_catch_up_rereads_the_schedule_it_refreshed(db, monkeypatch):
+    now = _setup(db, monkeypatch)
+    _missing_earlier_game(db)
+
+    def load(d, t):  # the refresh finds the box score, and that the game was postponed
+        d.team_player_games.insert_one({**d.team_player_games.find_one({}, {"_id": 0}), "game_id": "EARLIER",
+                                        "game_date": day(2 * GAME - 1)})
+        d.schedule.update_one({"game_id": f"00225{GAME:05d}"}, {"$set": {"status": "postponed"}})
+        return True
+    assert predict.run(db, now, cards={"m2": _card()}, versions=("m2",), load=load)
+    assert db.predictions.count_documents({}) == 0
+
+
+@atlas
+def test_failed_catch_up_is_reported_and_retried(db, monkeypatch):
+    now = _setup(db, monkeypatch)
+    _missing_earlier_game(db)
+    assert not predict.run(db, now, cards={"m2": _card()}, versions=("m2",), load=lambda d, t: False)
+    assert db.predictions.count_documents({}) == 0  # retried next run, not locked in
+    game = db.schedule.find_one({"game_id": f"00225{GAME:05d}"})
+    assert predict.catch_up(db, game, TIP - timedelta(minutes=70), lambda d, t: True) is None  # too close: skip
+    budgets = []  # 76 min out: 60 s left before the cutoff, minus the 15 s margin
+    predict.catch_up(db, game, TIP - timedelta(minutes=76), lambda d, t: budgets.append(t) or True)
+    assert budgets == [45.0]
+
+
+@atlas
+def test_catch_up_fits_in_what_is_left_of_the_task(db, monkeypatch):
+    now = _setup(db, monkeypatch)
+    _missing_earlier_game(db)
+    game = db.schedule.find_one({"game_id": f"00225{GAME:05d}"})
+    budgets = []
+    monkeypatch.setenv("GLAZER_TASK_STARTED", str(__import__("time").time() - 100))  # 100 s already used
+    predict.catch_up(db, game, now, lambda d, t: budgets.append(t) or True)
+    assert 70 <= budgets[0] <= 75
+    monkeypatch.setenv("GLAZER_TASK_STARTED", str(__import__("time").time() - 200))  # only 10 s to spare
+    assert predict.catch_up(db, game, now, lambda d, t: budgets.append(t) or True) == "no_time" and len(budgets) == 1
+    # Not an error: with 1 h 50 min to go the game waits for the next run, and the run still succeeds.
+    assert predict.run(db, now, cards={"m2": _card()}, versions=("m2",), load=lambda d, t: True)
+    assert db.predictions.count_documents({}) == 0
+
+
+@atlas
+def test_github_actions_leaves_incomplete_games_to_the_laptop(db, monkeypatch):
+    now = _setup(db, monkeypatch)
+    _missing_earlier_game(db)
+    monkeypatch.setenv("GITHUB_ACTIONS", "true")
+    calls = []
+    game = db.schedule.find_one({"game_id": f"00225{GAME:05d}"})
+    assert predict.catch_up(db, game, now, lambda d, t: calls.append(t) or True) is None and calls == []
+    assert predict.run(db, now, cards={"m2": _card()}, versions=("m2",)) and db.predictions.count_documents({}) == 0
+    late = TIP - timedelta(minutes=70)  # the last 75 minutes: Actions is the fallback
+    monkeypatch.setattr(predict, "utcnow", lambda: late + timedelta(seconds=40))
+    assert predict.run(db, late, cards={"m2": _card()}, versions=("m2",)) and db.predictions.count_documents({}) == 3
+
+
+@atlas
+def test_missing_luka_log_is_a_warning_even_with_the_team_box_score(db, monkeypatch):
+    now = _setup(db, monkeypatch)
+    last = db.games.find_one(sort=[("game_date", -1)])
+    db.games.delete_one({"_id": last["_id"]})  # his log request failed; the team box score (with him) loaded
+    game = db.schedule.find_one({"game_id": f"00225{GAME:05d}"})
+    warnings, _ = predict.input_warnings(db, game, now)
+    assert any(last["game_id"] in w and "Luka's game log" in w for w in warnings)

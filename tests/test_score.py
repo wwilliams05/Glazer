@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 
 from luka.model.m3 import rps
-from luka.model.score import paired, rps_from_strikes, run, track_record
+from luka.model.score import calibration, paired, rps_from_strikes, run, track_record
 from luka.model.train import p_at_least
 from test_features import db  # noqa: F401  (fixture: empty luka_test with the schema applied)
 
@@ -78,3 +78,20 @@ def test_scores_once_voids_dnp_and_waits_for_box_scores(db):
     # m2 scored PLAYED (40 vs 30) and LOGFAIL (33 vs 30); season average was 29 for both.
     assert table["m2 pts"]["games"] == 2 and table["m2 pts"]["mae"] == 6.5 and table["m2 pts"]["small_sample"]
     assert table["m2 pts"]["baseline_mae"] == 7.5 and "m3 pts" in table
+
+
+@atlas
+def test_calibration_uses_listed_strikes_only(db):
+    # Two scored games; the ladder listed 25 and 35. Actual 30 both times.
+    for gid in ("G1", "G2"):
+        p = _pred(gid); p["market"] = {"venue": "kalshi", "snapshot_at": TIP - timedelta(hours=3), "strikes": [25, 35]}
+        db.predictions.insert_one(p)
+        db.schedule.insert_one(_sched(gid))
+        db.games.insert_one({"game_id": gid, "player_id": 1629029, "season": "2025-26", "game_date": TIP,
+                             "opponent": "BBB", "home": True, "minutes": 36, "pts": 30, "reb": 8, "ast": 9})
+    run(db, now=TIP + timedelta(hours=10))
+    rows = calibration(db, "m2")
+    assert sum(r["strikes"] for r in rows) == 4  # 2 games x 2 listed strikes, not the whole grid
+    p25, p35 = p_at_least(30.0, 25, RES), p_at_least(30.0, 35, RES)
+    assert any(abs(r["predicted"] - p25) < 1e-9 and r["happened"] == 1 for r in rows)
+    assert any(abs(r["predicted"] - p35) < 1e-9 and r["happened"] == 0 for r in rows)

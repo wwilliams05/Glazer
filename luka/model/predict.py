@@ -23,7 +23,9 @@ Actions copy of this task racing the laptop, can't replace a prediction before t
 """
 import argparse
 import math
+import os
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 
 import numpy as np
@@ -95,7 +97,16 @@ def input_warnings(db, game: dict, now: datetime) -> tuple[list[str], datetime |
         "tip_off": {"$lt": now},
     })
     for m in missed:
-        warnings.append(f"no box score yet for {m['game_key']} ({m['game_id']}); inputs end at the game before it")
+        warnings.append(f"no team box score yet for {m['game_key']} ({m['game_id']}); teammate inputs end before "
+                        f"it, and Luka's averages may too")
+    # His own game log can fail while the team's box score loads (two different requests).
+    # A game he sat out has no row of his in team_player_games either, so it doesn't trigger this.
+    his = db.team_player_games.find(
+        {"team": game["team"], "player_id": PLAYER_ID, "game_date": {"$lt": game["game_date"]}},
+        {"game_id": 1}).sort("game_date", -1).limit(5)
+    for row in his:
+        if db.games.find_one({"game_id": row["game_id"], "player_id": PLAYER_ID}, {"_id": 1}) is None:
+            warnings.append(f"Luka's game log for {row['game_id']} isn't loaded; his averages end before it")
     return warnings, through
 
 
@@ -347,18 +358,179 @@ def _summary(game: dict, features: dict, preds: list[dict]) -> str:
     return "\n".join(lines)
 
 
+TASK_LIMIT_S = 300  # the Windows snapshot task's limit (PT5M); also the Actions job's timeout
+PREDICT_RESERVE_S = 90  # kept free for both predictions after a catch-up
+CATCH_UP_MAX_S, CATCH_UP_MIN_S, CATCH_UP_MARGIN_S = 75, 20, 15
+# One cutoff for everything: a laptop catch-up must *finish* before tip-off - CATCH_UP_UNTIL,
+# and GitHub Actions holds back a game with missing inputs only until then. So no catch-up can
+# still be writing when either copy starts predicting, and Actions keeps a 70-minute fallback
+# window (about 4-5 runs) for days the laptop is off.
+CATCH_UP_UNTIL = timedelta(minutes=75)
+RETRY_UNTIL = CATCH_UP_UNTIL + timedelta(minutes=15)  # before this, missing inputs wait for the next run
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+def in_github_actions() -> bool:
+    return os.environ.get("GITHUB_ACTIONS") == "true"
+
+
+def catch_up_budget() -> float:
+    """Seconds a catch-up may take: what is left of the task's limit after the network wait
+    and the snapshots (scripts/run_logged.py sets GLAZER_TASK_STARTED), minus the reserve."""
+    started = os.environ.get("GLAZER_TASK_STARTED")
+    elapsed = time.time() - float(started) if started else 0.0
+    return min(CATCH_UP_MAX_S, TASK_LIMIT_S - elapsed - PREDICT_RESERVE_S)
+
+
+def _tail(text: str | None, n: int) -> list[str]:
+    return (text or "").splitlines()[-n:]
+
+
+def _load_current_season(db, timeout_s: float) -> bool:
+    """Run the daily update (`luka.ingest.games --current`) in a separate process with a hard
+    time limit. A separate process, not a thread: if stats.nba.com hangs, killing the process
+    stops it for good, so nothing it fetched can be written after the prediction's as_of.
+
+    On Windows the venv's python.exe is a launcher that starts the real interpreter as its own
+    child, so a timeout kills the whole process tree (taskkill /T), not just the launcher.
+    """
+    import subprocess
+
+    child = subprocess.Popen(
+        [sys.executable, "-m", "luka.ingest.games", "--current"], cwd=ROOT,
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, encoding="utf-8", errors="replace", env={**os.environ, "PYTHONIOENCODING": "utf-8"})
+    try:
+        out, err = child.communicate(timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        if os.name == "nt":
+            killed = subprocess.run(["taskkill", "/T", "/F", "/PID", str(child.pid)], capture_output=True)
+            if killed.returncode != 0:
+                print(f"  taskkill exit {killed.returncode}; falling back to kill()")
+        child.kill()  # no-op if taskkill already ended it
+        try:
+            out, err = child.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            out, err = "", ""
+        if child.poll() is None:
+            print("  catch-up process is still running after being killed")
+            return "running"
+        print(f"  catch-up stopped after {timeout_s:.0f} s (stats.nba.com slow or down); last output:")
+        for line in _tail(out, 4) + _tail(err, 4):
+            print(f"    {line}")
+        return False
+    lines = (out or "").splitlines()
+    for line in [l for l in lines if "ERROR" in l] + lines[-4:]:
+        print(f"    {line}")
+    if child.returncode != 0:
+        for line in _tail(err, 6):
+            print(f"    stderr: {line}")
+    return child.returncode == 0
+
+
+def catch_up(db, game: dict, now: datetime, load=_load_current_season) -> bool | None:
+    """Load missing box scores before predicting, if an earlier game of the team has none yet.
+
+    The daily game-log task normally loads last night's game by morning. When it doesn't (it
+    was broken 2026-11-22 to 11-25), the prediction would quietly use stale inputs. This runs
+    before any version fixes its as_of, so whatever it loads still predates the decision.
+
+    Returns None if nothing was attempted, else whether the load succeeded. Not attempted in
+    GitHub Actions (stats.nba.com blocks its servers) or within CATCH_UP_UNTIL of tip-off.
+    """
+    warnings, _ = input_warnings(db, game, now)
+    if not warnings or in_github_actions():
+        return None
+    # Finish before the cutoff: the budget is also capped by the time left until it, less a
+    # margin for the queries before the load starts and the kill afterwards.
+    to_cutoff = (game["tip_off"] - CATCH_UP_UNTIL - now).total_seconds() - CATCH_UP_MARGIN_S
+    if to_cutoff <= 0:
+        return None
+    budget = min(catch_up_budget(), to_cutoff)
+    if budget < CATCH_UP_MIN_S:
+        print(f"  {game['game_id']}: only {budget:.0f} s available in this run; no catch-up")
+        return "no_time"
+    print(f"  catching up before predicting {game['game_id']}: {len(warnings)} earlier game(s) without box scores")
+    return load(db, budget)
+
+
+def prepare(db, game: dict, now: datetime, missing: dict[str, list], load, clock=None) -> tuple[dict | None, bool]:
+    """Before predicting a game: hold back, catch up, re-check. Returns (game or None to skip, ok).
+
+    - GitHub Actions leaves a game with missing inputs to the laptop until CATCH_UP_UNTIL.
+    - The laptop catches up only while no version has predicted yet, so m2 and m3 see the same
+      inputs. After a catch-up it re-reads the game (the load refreshes the schedule, which can
+      move or postpone it) and, if box scores are still missing with time to spare, waits for
+      the next run rather than locking a stale prediction in.
+    """
+    clock = clock or utcnow
+    game = {**game, "tip_off": earliest_tip_off(db, game, now)}  # a venue may know it moved earlier
+    if game["tip_off"] <= now + LAST_CALL:
+        print(f"  {game['game_id']}: a venue shows an earlier tip-off; too late to start a prediction")
+        return None, True
+    early = game["tip_off"] - now >= CATCH_UP_UNTIL
+    if in_github_actions() and early and input_warnings(db, game, now)[0]:
+        print(f"  {game['game_id']}: inputs incomplete; leaving it to the laptop until "
+              f"{(game['tip_off'] - CATCH_UP_UNTIL):%H:%MZ}")
+        return None, True
+    if not all(len(v) == len(STATS) for v in missing.values()):  # some version already started
+        return game, True
+    try:
+        result = catch_up(db, game, now, load)
+    except Exception as e:
+        print(f"  ERROR catching up: {type(e).__name__}: {e}")
+        result = False
+    if result is None:
+        return game, True
+    if result == "no_time":  # this run is nearly out of time: retry next run if there's room
+        return (None, True) if game["tip_off"] - now >= RETRY_UNTIL else (game, True)
+    if result == "running":  # couldn't stop it: its writes would land after our as_of
+        print(f"  {game['game_id']}: catch-up still running; not predicting it in this run")
+        return None, False
+    ok = result is not False
+    if not ok:
+        print("  ERROR catch-up failed")
+    now = clock()  # the catch-up took time; check what's left with a fresh clock
+    fresh = db.schedule.find_one({"game_id": game["game_id"]})
+    if fresh is not None:
+        fresh = {**fresh, "tip_off": earliest_tip_off(db, fresh, now)}
+    if (fresh is None or fresh["status"] != "scheduled" or fresh.get("tip_time_tbd")
+            or fresh["tip_off"] <= now + LAST_CALL or fresh["tip_off"] > now + PREDICT_LEAD):
+        print(f"  {game['game_id']}: schedule changed during catch-up; not predicting it in this run")
+        return None, ok
+    if input_warnings(db, fresh, now)[0] and fresh["tip_off"] - now >= RETRY_UNTIL:
+        print(f"  {game['game_id']}: box scores still missing; trying again in the next run")
+        return None, ok
+    return fresh, ok
+
+
 def run(db, now: datetime | None = None, dry_run: bool = False, card: dict | None = None,
-        versions: tuple[str, ...] = tuple(VERSIONS), cards: dict[str, dict] | None = None) -> bool:
+        versions: tuple[str, ...] = tuple(VERSIONS), cards: dict[str, dict] | None = None,
+        load=_load_current_season) -> bool:
     """Predict every due game that is missing a prediction, for each model version.
     Returns False if anything failed.
 
-    card: m2's card (tests); cards: {model_version: card} for any version (tests).
+    card: m2's card (tests); cards: {model_version: card} for any version (tests);
+    load: how catch_up loads data (tests).
     """
     fixed_now = now  # tests pass a time; live runs read the clock afresh for each version
     now = now or utcnow()
     cards = {**({MODEL_VERSION: card} if card else {}), **(cards or {})}
     ok = True
     for game in due_games(db, now):
+        missing = {v: missing_stats(db, game["game_id"], v) for v in versions}
+        if not any(missing.values()):
+            continue
+        if not dry_run:
+            try:
+                game, prep_ok = prepare(db, game, fixed_now or utcnow(), missing, load,
+                                        clock=(lambda: fixed_now) if fixed_now else utcnow)
+            except Exception as e:  # e.g. an Atlas blip: skip this game this run, keep the others
+                print(f"  ERROR preparing {game['game_id']}: {type(e).__name__}: {e}")
+                game, prep_ok = None, False
+            ok &= prep_ok
+            if game is None:
+                continue
         for version in versions:
             stats = missing_stats(db, game["game_id"], version)
             if not stats:
