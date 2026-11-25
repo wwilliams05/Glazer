@@ -188,8 +188,14 @@ PREDICTIONS = _validator(
                 "strikes": {"bsonType": "array", "items": NONNEG},  # the ladder listed at snapshot_at
             },
         },
+        # Set once by luka.model.score after the game; nothing above changes.
         "actual": {"bsonType": ["number", "null"]},
-        "error": {"bsonType": ["number", "null"]},
+        "error": {"bsonType": ["number", "null"]},  # actual - prediction
+        "in_range": BOOL,
+        "rps": NONNEG,  # ranked probability score of strike_probs
+        "void": BOOL,  # Luka didn't play, or the game moved after the prediction
+        "void_reason": STR,
+        "scored_at": DATE,
     },
     {"$lte": ["$range.low", "$prediction"]},
     {"$lte": ["$prediction", "$range.high"]},
@@ -201,6 +207,9 @@ PREDICTIONS = _validator(
     # ...and written before it, too: created_at is when the doc was written, at or after as_of.
     {"$or": [{"$eq": [{"$type": "$tip_off"}, "missing"]}, {"$lt": ["$created_at", "$tip_off"]}]},
     {"$lte": ["$as_of", "$created_at"]},
+    # Scored only after the game: if both are present, scored_at is after tip-off.
+    {"$or": [{"$eq": [{"$type": "$scored_at"}, "missing"]}, {"$eq": [{"$type": "$tip_off"}, "missing"]},
+             {"$gt": ["$scored_at", "$tip_off"]}]},
 )
 
 PAPER_TRADES = _validator(

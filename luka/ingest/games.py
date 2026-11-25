@@ -177,11 +177,13 @@ def main() -> None:
     ok = run(db, seasons, dry_run=args.dry_run)
     if args.current and not args.dry_run:
         # The daily scheduled task runs only this module, so it refreshes team data and the
-        # schedule (tip-off times for live predictions) too.
+        # schedule (tip-off times for live predictions) too, then scores finished predictions.
         from luka.ingest import schedule, teams
+        from luka.model import score
 
         ok &= teams.run(db, seasons)
         ok &= schedule.run(db, seasons[0])
+        ok &= score.run(db)
     sys.exit(0 if ok else 1)
 
 

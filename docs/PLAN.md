@@ -50,6 +50,37 @@ Range coverage meets the 70–90% target for all three. Beating the baseline is 
 - [x] `model/cards/m2.json`: the walk-forward's model choice and residuals, frozen. Live `m2` refits that choice on every finished game before the one it predicts (the test-table numbers above were trained on seasons before 2025-26 only)
 - [x] `ingest/markets.py` exits early when the schedule shows no game within 30 h; falls back to the schedule's tip-off when Polymarket has none
 - [ ] Laptop asleep at prediction time = no prediction (risk 6). GitHub Actions runs the same step once this is on `main`; the unique index stops the two from writing twice
+- [x] 2026-11-23 (UTA): first live `m2` prediction written at 01:09 UTC, 1 h 50 min before tip, against a Kalshi snapshot 6 s older
+- [ ] The "Glazer game logs" task still points at the deleted `scripts/update_games.cmd`, so it has failed daily since 2026-11-22 (caught up by hand on 2026-11-25). Re-register it with `run_logged.py` (command in the 2026-11-25 session notes)
+
+## m3 (added 2026-11-25): runs beside m2 on live games
+
+Built from games before 2026-11-23 only (`DEV_CUTOFF` in `model/m3.py`; card frozen 2026-11-25). m3's clean holdout is the games it predicts live, from its first live run on (2026-11-27 SAS); m2's starts at 2026-11-23. Never backfill a prediction for a game already played. The candidate list was shaped while the 2025-26 test numbers were visible, so m3's test columns below are optimistic. Exploration scripts were throwaway; what they showed:
+
+- **Baseline:** a recency-weighted average over Luka's earlier games (10-game half-life, across seasons; f2's `*_ew10`) beat the season-to-date average in the walk-forward for all three stats (PTS 6.62 → 6.44, REB 2.435 → 2.408, AST 2.661 → 2.602).
+- **Teammates-out features added nothing,** even with perfect (box-score) knowledge of who sat, in ridge or boosting. m3 drops them, which also removes m2's calibration leak (m2's residuals were measured with same-game availability that live rows don't have).
+- **More features hurt boosting** (about 400 training games); ridge was neutral. Each model family keeps a small input set.
+- **Distribution shape barely matters:** empirical residuals, scaled residuals, normal and negative binomial were within 1% on RPS; Poisson was too narrow for PTS (61% coverage). m3 keeps m2's empirical residuals.
+- **Single models disagreed** between walk-forward and test; an equal-weight ensemble of one model from each family was best or near best on both.
+
+Chosen by walk-forward MAE (2021-22 to 2024-25):
+
+| Stat | m3 | Walk-forward MAE m2 → m3 | Test MAE m2 → m3 | Test RPS m2 → m3 | Test 80% coverage m2 → m3 |
+|---|---|---|---|---|---|
+| PTS | season + boosting, averaged with EW10 + ridge | 6.48 → 6.34 | 7.26 → 7.31 | 5.23 → 5.23 | 77% → 77% |
+| REB | average of season average and EW10 | 2.435 → 2.406 | 2.57 → 2.53 | 1.79 → 1.73 | 76% → 84% |
+| AST | EW10 | 2.658 → 2.602 | 2.43 → 2.41 | 1.67 → 1.71 | 84% → 81% |
+
+RPS = ranked probability score, the squared error of P(stat ≥ k) summed over every k; lower is better, and it rewards probabilities that are both calibrated and sharp. Test = 2025-26 to 2026-11-22 (79 games, not clean). **m3 is not proven better.** It wins the larger walk-forward by 1–2% and is mixed on the test games. Live games decide.
+
+**Decision rule, written 2026-11-25 before any m3 live result:** after 30 live games where both versions predicted before tip-off, compare per stat on mean RPS (primary) and MAE (secondary), using the paired difference with a 90% bootstrap interval over games. A version replaces the other for paper trading on a stat only if its RPS interval excludes 0 in its favour; otherwise keep m2 as the trading model and keep both running. The winner's live numbers from those 30 games are then biased upward; report its later games separately.
+
+- [x] `features/pipeline.py`: f2 = f1 + `*_ew10` (pandas, on the same frame as the live placeholder)
+- [x] `model/m3.py`, `model/cards/m3.json` (frozen); `python -m luka.model.m3` prints the candidate table
+- [x] `model/predict.py` writes m2 then m3 for each game, each in its own try
+- [x] Tried and dropped: **pooling other stars' games.** A model of "stat − own EW10" trained on 17,600 star player-games (EW10 ≥ 30 min and ≥ 20 pts, 2018-19 to 2024-25) learned sensible but tiny effects (home +0.27 pts, back-to-back −0.39, +0.24 pts per possession of opponent pace). Applied to Luka's walk-forward it didn't help (PTS 6.71 → 6.78, REB 2.427 → 2.422, AST 2.645 → 2.653). Pre-game context barely moves his numbers; the game-to-game noise dominates
+- [ ] Not tried yet: opponent rebounds and assists allowed (needs those columns in `team_games`), injury reports (week 4), market prices as an input
+- [x] `model/score.py` (pulled forward from week 4): after each game, sets `actual`, `error`, `in_range`, `rps`, or `void` if Luka sat. Runs inside `games --current`; `python -m luka.model.score --report` prints the live track record per model version and the paired m2-vs-m3 comparison. Waits for `schedule` to say final; voids postponed or moved games. Unchecked: whether stats.nba.com files a Cup final (game id 006…) under a season type `games.py` requests; if not, such a prediction waits forever
 
 ## Repo layout
 
